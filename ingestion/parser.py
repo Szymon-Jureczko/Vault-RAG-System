@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 PDF_EXTENSIONS = {".pdf"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp"}
 TEXT_EXTENSIONS = {".txt", ".md", ".rst", ".csv", ".json", ".xml", ".html"}
-OFFICE_EXTENSIONS = {".docx", ".xlsx", ".eml"}
+OFFICE_EXTENSIONS = {".docx"}
+XLSX_EXTENSIONS = {".xlsx"}
+EML_EXTENSIONS = {".eml"}
 
 
 class Chunk(BaseModel):
@@ -300,7 +302,12 @@ class TesseractParser(BaseParser):
 
         try:
             image = Image.open(path)
+            # Resize large images to prevent OOM in worker processes
+            max_dim = 2000
+            if max(image.size) > max_dim:
+                image.thumbnail((max_dim, max_dim), Image.LANCZOS)
             text = pytesseract.image_to_string(image)
+            image.close()
             chunks = _split_text(text, path, chunk_size, self.name, page=1)
 
             return ParserResult(
@@ -365,13 +372,136 @@ class TextParser(BaseParser):
             )
 
 
+# ── XLSX parser (openpyxl, lightweight) ───────────────────────────────────
+
+
+class OpenpyxlParser(BaseParser):
+    """Lightweight XLSX parser using openpyxl instead of Docling."""
+
+    @property
+    def name(self) -> str:
+        return "openpyxl"
+
+    @property
+    def extensions(self) -> set[str]:
+        return XLSX_EXTENSIONS
+
+    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:
+            return ParserResult(
+                file_path=str(path),
+                success=False,
+                error=f"openpyxl not installed: {exc}",
+                parser_name=self.name,
+            )
+
+        try:
+            wb = load_workbook(str(path), read_only=True, data_only=True)
+            parts: list[str] = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                rows: list[str] = [f"## Sheet: {sheet_name}"]
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) if c is not None else "" for c in row]
+                    rows.append(" | ".join(cells))
+                parts.append("\n".join(rows))
+            wb.close()
+
+            full_text = "\n\n".join(parts)
+            chunks = _split_text(full_text, path, chunk_size, self.name)
+            return ParserResult(
+                file_path=str(path),
+                chunks=chunks,
+                parser_name=self.name,
+                page_count=len(wb.sheetnames) if parts else 0,
+                success=True,
+            )
+        except Exception as exc:
+            logger.error("OpenpyxlParser failed on %s: %s", path, exc)
+            return ParserResult(
+                file_path=str(path),
+                success=False,
+                error=str(exc),
+                parser_name=self.name,
+            )
+
+
+# ── EML parser ─────────────────────────────────────────────────────────────
+
+
+class EmlParser(BaseParser):
+    """Parser for RFC-822 email files (.eml) using stdlib ``email``."""
+
+    @property
+    def name(self) -> str:
+        return "eml"
+
+    @property
+    def extensions(self) -> set[str]:
+        return EML_EXTENSIONS
+
+    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+        """Extract headers and body text from an EML file.
+
+        Args:
+            path: Path to the .eml file.
+            chunk_size: Approximate characters per chunk.
+
+        Returns:
+            ParserResult with email content as text chunks.
+        """
+        import email as _email
+
+        try:
+            msg = _email.message_from_bytes(path.read_bytes())
+            parts: list[str] = []
+
+            # Include key headers as context
+            for header in ("Subject", "From", "To", "CC", "Date"):
+                val = msg.get(header)
+                if val:
+                    parts.append(f"{header}: {val}")
+
+            # Extract all text/plain and text/html payloads
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct not in ("text/plain", "text/html"):
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                payload = part.get_payload(decode=True)
+                if payload:
+                    parts.append(payload.decode(charset, errors="replace"))
+
+            full_text = "\n\n".join(parts)
+            chunks = _split_text(full_text, path, chunk_size, self.name)
+            return ParserResult(
+                file_path=str(path),
+                chunks=chunks,
+                parser_name=self.name,
+                page_count=1,
+                success=True,
+            )
+        except Exception as exc:
+            logger.error("EmlParser failed on %s: %s", path, exc)
+            return ParserResult(
+                file_path=str(path),
+                success=False,
+                error=str(exc),
+                parser_name=self.name,
+            )
+
+
 # ── Dispatcher ──────────────────────────────────────────────────────────────
 
 _PARSERS: list[BaseParser] = [
+    OpenpyxlParser(),
     DoclingParser(),
     PyMuPDFParser(),
     TesseractParser(),
     TextParser(),
+    EmlParser(),
 ]
 
 # Extension → parser lookup (first match wins; Docling for PDFs)
