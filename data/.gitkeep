@@ -1,0 +1,2 @@
+# This directory holds runtime data (ChromaDB, SQLite state DB).
+# Contents are gitignored — only this file is committed.

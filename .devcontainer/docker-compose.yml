@@ -1,0 +1,40 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - ..:/workspace:cached
+      - pip-cache:/home/vscode/.cache/pip
+    command: sleep infinity
+    environment:
+      - PYTHONPATH=/workspace
+    env_file:
+      - path: ../.env
+        required: false
+    # Limit to leave headroom for Ollama on 16 GB host
+    mem_limit: 6g
+    networks:
+      - ragsystem
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    # CPU-only — Intel i5-1135G7 has no CUDA.
+    # Raise or remove this limit once you know your model's steady-state RAM.
+    mem_limit: 8g
+    networks:
+      - ragsystem
+
+volumes:
+  ollama-models:   # persists pulled models across container restarts
+  pip-cache:       # speeds up pip installs in postCreateCommand
+
+networks:
+  ragsystem:

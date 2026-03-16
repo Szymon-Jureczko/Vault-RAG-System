@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "localvaultrag"
+version = "0.1.0"
+description = "Privacy-first enterprise RAG system — 100% local inference"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"

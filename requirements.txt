@@ -1,0 +1,37 @@
+# ── Core LLM / RAG (local Ollama backend) ────────────────────────────────────
+langchain>=0.3
+langchain-community>=0.3
+langchain-ollama>=0.2
+
+# ── Embeddings (local, best latency/RAM trade-off on i5 + 16 GB) ─────────────
+sentence-transformers>=3.0            # all-MiniLM-L6-v2
+torch>=2.2                            # sentence-transformers runtime
+
+# ── Vector Store — ChromaDB persistent disk mode ─────────────────────────────
+chromadb>=0.5
+
+# ── Document Parsers ──────────────────────────────────────────────────────────
+pymupdf>=1.24                         # PyMuPDF — fast PDF extraction
+docling>=2.0                          # layout-aware parsing
+pytesseract>=0.3                      # Tesseract OCR wrapper (system tesseract required)
+
+# ── State DB / incremental logic ─────────────────────────────────────────────
+# SQLite ships with Python stdlib — no package needed.
+# Pydantic for typed models throughout.
+pydantic>=2.0
+pydantic-settings>=2.0
+
+# ── API Server ────────────────────────────────────────────────────────────────
+fastapi>=0.115
+uvicorn[standard]>=0.30
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv>=1.0
+tenacity>=8.0
+httpx>=0.27
+
+# ── Dev / Notebook ────────────────────────────────────────────────────────────
+jupyterlab>=4.0
+ipykernel>=6.0
+pytest>=8.0
+pytest-asyncio>=0.24

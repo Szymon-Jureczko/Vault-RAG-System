@@ -1,0 +1,46 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ───────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── IDE / Editors ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Environment / Secrets ──────────────────────────────────────────────────
+.env
+
+# ── Data (generated at runtime — don't commit) ─────────────────────────────
+data/*
+!data/.gitkeep
+*.db
+
+# ── OS files ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Test / Coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# ── Model caches (can be large) ───────────────────────────────────────────
+*.onnx
+*.bin
+*.safetensors
