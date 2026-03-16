@@ -196,11 +196,13 @@ class IngestionPipeline:
     def _init_chroma(self):
         """Initialise ChromaDB collection and embedding function.
 
+        Tries ONNX runtime for ~3x faster CPU inference, falls back
+        to standard PyTorch SentenceTransformer.
+
         Returns:
             Tuple of (collection, embedding_fn).
         """
         import chromadb
-        from sentence_transformers import SentenceTransformer
 
         self._chroma_path.mkdir(parents=True, exist_ok=True)
         client = chromadb.PersistentClient(path=str(self._chroma_path))
@@ -209,10 +211,47 @@ class IngestionPipeline:
             metadata={"hnsw:space": "cosine"},
         )
 
-        model = SentenceTransformer(settings.embedding_model)
+        # Try ONNX backend first for faster CPU inference
+        try:
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from transformers import AutoTokenizer
+            import numpy as np
 
-        def embed_fn(texts: list[str]) -> list[list[float]]:
-            return model.encode(texts, show_progress_bar=False).tolist()
+            tokenizer = AutoTokenizer.from_pretrained(
+                f"sentence-transformers/{settings.embedding_model}"
+            )
+            ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                f"sentence-transformers/{settings.embedding_model}",
+                export=True,
+            )
+            logger.info("Using ONNX runtime for embeddings")
+
+            def embed_fn(texts: list[str]) -> list[list[float]]:
+                encoded = tokenizer(
+                    texts, padding=True, truncation=True,
+                    max_length=512, return_tensors="np",
+                )
+                outputs = ort_model(**encoded)
+                # Mean pooling over token embeddings
+                mask = encoded["attention_mask"]
+                embeddings = (
+                    outputs.last_hidden_state * mask[..., np.newaxis]
+                ).sum(axis=1) / mask.sum(axis=-1, keepdims=True)
+                # Normalize
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                embeddings = embeddings / norms
+                return embeddings.tolist()
+
+        except Exception as exc:
+            logger.info("ONNX unavailable (%s), using PyTorch", exc)
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(settings.embedding_model)
+
+            def embed_fn(texts: list[str]) -> list[list[float]]:
+                return model.encode(
+                    texts, show_progress_bar=False
+                ).tolist()
 
         return collection, embed_fn
 
