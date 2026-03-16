@@ -64,7 +64,7 @@ class TestParseFile:
     """Tests for the top-level parse_file function."""
 
     def test_unsupported_returns_failure(self) -> None:
-        """parse_file with unsupported extension returns a failed ParseResult."""
+        """parse_file with unsupported extension returns a failed result."""
         result = parse_file(Path("file.xyz"))
         assert result.success is False
         assert "Unsupported" in (result.error_message or "")

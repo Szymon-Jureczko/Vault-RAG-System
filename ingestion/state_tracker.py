@@ -277,7 +277,8 @@ class StateTracker:
         """
         now = _now_iso()
         self.conn.execute(
-            "UPDATE file_state SET parsing_status = ?, updated_at = ? WHERE file_path = ?",
+            "UPDATE file_state SET parsing_status = ?, "
+            "updated_at = ? WHERE file_path = ?",
             (status.value, now, str(file_path)),
         )
         self.conn.commit()
@@ -291,6 +292,7 @@ class StateTracker:
             Dict like ``{"pending": 3, "completed": 42, ...}``.
         """
         rows = self.conn.execute(
-            "SELECT parsing_status, COUNT(*) AS cnt FROM file_state GROUP BY parsing_status"
+            "SELECT parsing_status, COUNT(*) AS cnt "
+            "FROM file_state GROUP BY parsing_status"
         ).fetchall()
         return {row["parsing_status"]: row["cnt"] for row in rows}

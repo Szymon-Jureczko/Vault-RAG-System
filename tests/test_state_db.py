@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -74,7 +73,9 @@ class TestStateDB:
         f.write_text("content")
         assert db.is_unchanged(f) is False
 
-    def test_is_unchanged_same_content(self, db: StateDB, tmp_path: Path) -> None:
+    def test_is_unchanged_same_content(
+        self, db: StateDB, tmp_path: Path,
+    ) -> None:
         """A file with matching MD5 is considered unchanged."""
         f = tmp_path / "same.txt"
         f.write_text("fixed content")
