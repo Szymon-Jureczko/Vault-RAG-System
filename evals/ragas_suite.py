@@ -1,0 +1,455 @@
+"""RAGAS evaluation suite — Faithfulness, Context Precision, Answer Relevancy.
+
+Generates a golden dataset of questions from sample documents, evaluates the
+RAG pipeline against it, and produces a benchmark report. Also measures
+Files-Per-Minute ingestion throughput and Query Latency.
+
+Usage::
+
+    python -m evals.ragas_suite --data-dir data/ \\
+        --sample-size 50 --questions 20
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import time
+from pathlib import Path
+
+import httpx
+from pydantic import BaseModel, Field
+
+from ingestion.config import settings
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+
+API_BASE = "http://localhost:8000"
+
+
+# ── Models ──────────────────────────────────────────────────────────────────
+
+
+class GoldenQuestion(BaseModel):
+    """A single question in the golden evaluation dataset.
+
+    Attributes:
+        question: The evaluation question.
+        ground_truth: Expected answer (human-written).
+        source_file: Document the question was derived from.
+    """
+
+    question: str
+    ground_truth: str
+    source_file: str
+
+
+class EvalResult(BaseModel):
+    """Evaluation scores for a single question.
+
+    Attributes:
+        question: The asked question.
+        answer: RAG-generated answer.
+        contexts: Retrieved context snippets.
+        ground_truth: Expected answer.
+        faithfulness: RAGAS faithfulness score (0-1).
+        context_precision: RAGAS context precision score (0-1).
+        answer_relevancy: RAGAS answer relevancy score (0-1).
+    """
+
+    question: str
+    answer: str = ""
+    contexts: list[str] = Field(default_factory=list)
+    ground_truth: str = ""
+    faithfulness: float = 0.0
+    context_precision: float = 0.0
+    answer_relevancy: float = 0.0
+
+
+class BenchmarkResult(BaseModel):
+    """Ingestion and query latency benchmarks.
+
+    Attributes:
+        total_files: Number of files ingested.
+        ingestion_seconds: Total ingestion time.
+        files_per_minute: Throughput metric.
+        avg_query_latency_ms: Average query response time.
+        queries_tested: Number of queries benchmarked.
+    """
+
+    total_files: int = 0
+    ingestion_seconds: float = 0.0
+    files_per_minute: float = 0.0
+    avg_query_latency_ms: float = 0.0
+    queries_tested: int = 0
+
+
+# ── Golden dataset generation ──────────────────────────────────────────────
+
+
+def generate_golden_dataset(
+    data_dir: Path,
+    sample_size: int = 50,
+    num_questions: int = 20,
+) -> list[GoldenQuestion]:
+    """Generate evaluation questions from sample documents via Ollama.
+
+    Selects up to ``sample_size`` documents from ``data_dir``, extracts
+    text snippets, and prompts the LLM to generate Q&A pairs.
+
+    Args:
+        data_dir: Directory containing source documents.
+        sample_size: Maximum documents to sample.
+        num_questions: Total questions to generate.
+
+    Returns:
+        List of GoldenQuestion instances.
+    """
+    from ingestion.parser import SUPPORTED_EXTENSIONS, parse_file
+
+    files = sorted(
+        f
+        for f in data_dir.rglob("*")
+        if f.suffix.lower() in SUPPORTED_EXTENSIONS and f.is_file()
+    )[:sample_size]
+
+    if not files:
+        logger.warning("No supported files found in %s", data_dir)
+        return []
+
+    # Extract text from each file
+    file_texts: list[tuple[str, str]] = []
+    for fp in files:
+        result = parse_file(fp, chunk_size=2000)
+        if result.success and result.chunks:
+            text = result.chunks[0].text[:1500]
+            file_texts.append((fp.name, text))
+
+    questions: list[GoldenQuestion] = []
+
+    for filename, text in file_texts:
+        if len(questions) >= num_questions:
+            break
+
+        prompt = (
+            "Generate a factual question and answer based on this document "
+            "excerpt. Return ONLY valid JSON: "
+            '{"question": "...", "answer": "..."}\n\n'
+            f"Document: {filename}\n\nExcerpt:\n{text}\n\nJSON:"
+        )
+
+        try:
+            resp = httpx.post(
+                f"{settings.ollama_base_url}/api/generate",
+                json={
+                    "model": settings.ollama_model_dev,
+                    "prompt": prompt,
+                    "stream": False,
+                },
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "")
+            # Extract JSON from response
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start >= 0 and end > start:
+                qa = json.loads(raw[start:end])
+                questions.append(
+                    GoldenQuestion(
+                        question=qa["question"],
+                        ground_truth=qa["answer"],
+                        source_file=filename,
+                    )
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to generate question from %s: %s",
+                filename, exc,
+            )
+
+    logger.info(
+        "Generated %d golden questions from %d files",
+        len(questions), len(file_texts),
+    )
+    return questions
+
+
+# ── RAGAS evaluation ───────────────────────────────────────────────────────
+
+
+def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
+    """Evaluate the RAG pipeline using RAGAS metrics.
+
+    For each golden question, queries the /query endpoint and computes
+    Faithfulness, Context Precision, and Answer Relevancy.
+
+    Args:
+        questions: List of GoldenQuestion instances.
+
+    Returns:
+        List of EvalResult instances.
+    """
+    try:
+        from datasets import Dataset
+        from ragas import evaluate
+        from ragas.metrics import (
+            answer_relevancy,
+            context_precision,
+            faithfulness,
+        )
+    except ImportError:
+        logger.error("RAGAS not installed. Run: pip install ragas datasets")
+        return _fallback_evaluate(questions)
+
+    # Collect RAG responses
+    rows = {"question": [], "answer": [], "contexts": [], "ground_truth": []}
+
+    for q in questions:
+        try:
+            resp = httpx.post(
+                f"{API_BASE}/query",
+                json={"question": q.question, "top_k": 5},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            rows["question"].append(q.question)
+            rows["answer"].append(data.get("answer", ""))
+            rows["contexts"].append(
+                [r["text"] for r in data.get("results", [])]
+            )
+            rows["ground_truth"].append(q.ground_truth)
+        except Exception as exc:
+            logger.warning("Query failed for '%s': %s", q.question, exc)
+            rows["question"].append(q.question)
+            rows["answer"].append("")
+            rows["contexts"].append([])
+            rows["ground_truth"].append(q.ground_truth)
+
+    dataset = Dataset.from_dict(rows)
+
+    result = evaluate(
+        dataset,
+        metrics=[faithfulness, context_precision, answer_relevancy],
+    )
+
+    eval_results = []
+    for i, q in enumerate(questions):
+        eval_results.append(
+            EvalResult(
+                question=q.question,
+                answer=rows["answer"][i],
+                contexts=rows["contexts"][i],
+                ground_truth=q.ground_truth,
+                faithfulness=result.get("faithfulness", 0.0),
+                context_precision=result.get("context_precision", 0.0),
+                answer_relevancy=result.get("answer_relevancy", 0.0),
+            )
+        )
+
+    return eval_results
+
+
+def _fallback_evaluate(questions: list[GoldenQuestion]) -> list[EvalResult]:
+    """Simple fallback evaluation when RAGAS is not installed.
+
+    Queries the API and reports raw results without RAGAS scoring.
+
+    Args:
+        questions: List of GoldenQuestion instances.
+
+    Returns:
+        List of EvalResult with zero scores.
+    """
+    results = []
+    for q in questions:
+        try:
+            resp = httpx.post(
+                f"{API_BASE}/query",
+                json={"question": q.question, "top_k": 5},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            results.append(
+                EvalResult(
+                    question=q.question,
+                    answer=data.get("answer", ""),
+                    contexts=[r["text"] for r in data.get("results", [])],
+                    ground_truth=q.ground_truth,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Fallback query failed: %s", exc)
+            results.append(
+                EvalResult(question=q.question, ground_truth=q.ground_truth)
+            )
+    return results
+
+
+# ── Benchmarking ───────────────────────────────────────────────────────────
+
+
+def benchmark_ingestion(data_dir: str = "data/") -> BenchmarkResult:
+    """Measure ingestion throughput (Files-Per-Minute).
+
+    Args:
+        data_dir: Source directory for ingestion.
+
+    Returns:
+        BenchmarkResult with timing data.
+    """
+    start = time.perf_counter()
+    try:
+        resp = httpx.post(
+            f"{API_BASE}/sync",
+            json={"source_dir": data_dir},
+            timeout=600,
+        )
+        resp.raise_for_status()
+        stats = resp.json()["stats"]
+    except Exception as exc:
+        logger.error("Ingestion benchmark failed: %s", exc)
+        return BenchmarkResult()
+
+    elapsed = time.perf_counter() - start
+    total = stats.get("total_discovered", 0)
+    fpm = (total / elapsed) * 60 if elapsed > 0 else 0
+
+    return BenchmarkResult(
+        total_files=total,
+        ingestion_seconds=round(elapsed, 2),
+        files_per_minute=round(fpm, 2),
+    )
+
+
+def benchmark_queries(questions: list[GoldenQuestion]) -> BenchmarkResult:
+    """Measure average query latency.
+
+    Args:
+        questions: Questions to benchmark.
+
+    Returns:
+        BenchmarkResult with latency data.
+    """
+    latencies: list[float] = []
+    for q in questions:
+        start = time.perf_counter()
+        try:
+            resp = httpx.post(
+                f"{API_BASE}/query",
+                json={"question": q.question, "top_k": 5},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            latencies.append((time.perf_counter() - start) * 1000)
+        except Exception:
+            pass
+
+    avg = sum(latencies) / len(latencies) if latencies else 0
+    return BenchmarkResult(
+        avg_query_latency_ms=round(avg, 2),
+        queries_tested=len(latencies),
+    )
+
+
+# ── CLI entrypoint ─────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    """Run the full evaluation and benchmarking suite."""
+    parser = argparse.ArgumentParser(description="RAGAS Evaluation Suite")
+    parser.add_argument(
+        "--data-dir", default="data/",
+        help="Document source directory",
+    )
+    parser.add_argument(
+        "--sample-size", type=int, default=50,
+        help="Max docs to sample",
+    )
+    parser.add_argument(
+        "--questions", type=int, default=20,
+        help="Golden questions to generate",
+    )
+    parser.add_argument(
+        "--output", default="evals/results.json",
+        help="Output file path",
+    )
+    args = parser.parse_args()
+
+    data_dir = Path(args.data_dir)
+
+    # Step 1: Generate golden dataset
+    logger.info("Generating golden dataset...")
+    golden = generate_golden_dataset(
+        data_dir, args.sample_size, args.questions,
+    )
+
+    if not golden:
+        logger.error("No golden questions generated. Check data directory.")
+        return
+
+    # Save golden dataset
+    golden_path = Path("evals/golden_dataset.json")
+    golden_path.parent.mkdir(parents=True, exist_ok=True)
+    golden_path.write_text(
+        json.dumps([q.model_dump() for q in golden], indent=2)
+    )
+    logger.info("Golden dataset saved to %s", golden_path)
+
+    # Step 2: RAGAS evaluation
+    logger.info("Running RAGAS evaluation...")
+    eval_results = evaluate_ragas(golden)
+
+    # Step 3: Benchmarks
+    logger.info("Running ingestion benchmark...")
+    ingest_bench = benchmark_ingestion(args.data_dir)
+
+    logger.info("Running query latency benchmark...")
+    query_bench = benchmark_queries(golden)
+
+    # Step 4: Report
+    report = {
+        "golden_dataset_size": len(golden),
+        "evaluation": [r.model_dump() for r in eval_results],
+        "benchmarks": {
+            "ingestion": ingest_bench.model_dump(),
+            "query": query_bench.model_dump(),
+        },
+    }
+
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2))
+    logger.info("Results saved to %s", output_path)
+
+    # Summary
+    if eval_results:
+        n = len(eval_results)
+        avg_faith = sum(
+            r.faithfulness for r in eval_results
+        ) / n
+        avg_prec = sum(
+            r.context_precision for r in eval_results
+        ) / n
+        avg_rel = sum(
+            r.answer_relevancy for r in eval_results
+        ) / n
+        print(f"\n{'='*50}")
+        print("RAGAS Evaluation Summary")
+        print(f"{'='*50}")
+        print(f"  Faithfulness:       {avg_faith:.3f}")
+        print(f"  Context Precision:  {avg_prec:.3f}")
+        print(f"  Answer Relevancy:   {avg_rel:.3f}")
+
+    print(f"\n  Ingestion: {ingest_bench.files_per_minute:.1f} files/min")
+    print(f"  Query Latency: {query_bench.avg_query_latency_ms:.1f} ms avg")
+    print(f"{'='*50}\n")
+
+
+if __name__ == "__main__":
+    main()
