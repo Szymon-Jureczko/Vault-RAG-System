@@ -11,6 +11,8 @@ Run with::
 from __future__ import annotations
 
 import logging
+import threading
+import uuid as _uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -69,11 +71,19 @@ class SyncResponse(BaseModel):
 
     Attributes:
         status: Overall status of the sync operation.
-        stats: Detailed ingestion statistics.
+        job_id: Unique identifier for the background sync job.
+        stats: Detailed ingestion statistics (populated when complete).
     """
 
     status: str
-    stats: IngestionStats
+    job_id: str = ""
+    stats: IngestionStats | None = None
+
+
+# ── Background job store ──────────────────────────────────────────────────
+
+_sync_jobs: dict[str, SyncResponse] = {}
+_sync_lock = threading.Lock()
 
 
 class QueryRequest(BaseModel):
@@ -135,16 +145,16 @@ class QueryResponse(BaseModel):
 
 @app.post("/sync", response_model=SyncResponse)
 def sync_documents(request: SyncRequest) -> SyncResponse:
-    """Trigger incremental document ingestion.
+    """Trigger incremental document ingestion in the background.
 
-    Scans the source directory, parses new/modified files, and commits
-    chunks to the vector store. Unchanged files are skipped.
+    Returns immediately with a job_id. Poll ``GET /sync/{job_id}``
+    to track progress.
 
     Args:
         request: SyncRequest with source directory path.
 
     Returns:
-        SyncResponse with status and ingestion statistics.
+        SyncResponse with job_id and initial status.
     """
     source = Path(request.source_dir)
     if not source.is_dir():
@@ -153,10 +163,47 @@ def sync_documents(request: SyncRequest) -> SyncResponse:
             detail=f"Source directory not found: {request.source_dir}",
         )
 
-    pipeline = _get_pipeline()
-    stats = pipeline.run(source)
+    job_id = _uuid.uuid4().hex[:12]
+    job = SyncResponse(status="running", job_id=job_id)
+    with _sync_lock:
+        _sync_jobs[job_id] = job
 
-    return SyncResponse(status="completed", stats=stats)
+    def _run_sync() -> None:
+        try:
+            pipeline = _get_pipeline()
+            stats = pipeline.run(source)
+            with _sync_lock:
+                _sync_jobs[job_id] = SyncResponse(
+                    status="completed", job_id=job_id, stats=stats,
+                )
+        except Exception as exc:
+            logger.error("Sync job %s failed: %s", job_id, exc)
+            with _sync_lock:
+                _sync_jobs[job_id] = SyncResponse(
+                    status=f"failed: {exc}", job_id=job_id,
+                )
+
+    thread = threading.Thread(target=_run_sync, daemon=True)
+    thread.start()
+
+    return job
+
+
+@app.get("/sync/{job_id}", response_model=SyncResponse)
+def sync_status(job_id: str) -> SyncResponse:
+    """Check the status of a background sync job.
+
+    Args:
+        job_id: The job identifier returned by POST /sync.
+
+    Returns:
+        SyncResponse with current status and stats (when complete).
+    """
+    with _sync_lock:
+        job = _sync_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    return job
 
 
 @app.post("/query", response_model=QueryResponse)
