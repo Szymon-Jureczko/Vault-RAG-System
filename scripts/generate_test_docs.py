@@ -13,6 +13,7 @@ from __future__ import annotations
 import email.mime.multipart
 import email.mime.text
 import random
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -47,6 +48,11 @@ TOPICS = [
 ]
 
 
+def _safe(text: str) -> str:
+    """Sanitize text to Latin-1 for fpdf core fonts (Helvetica etc.)."""
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def _body_paragraphs(n: int = 4) -> list[str]:
     """Return n paragraphs of fake body text."""
     topic = random.choice(TOPICS)
@@ -59,7 +65,7 @@ def _body_paragraphs(n: int = 4) -> list[str]:
 
 
 def _title() -> str:
-    return f"{random.choice(TOPICS).title()} — {fake.company()}"
+    return f"{random.choice(TOPICS).title()} - {fake.company()}"
 
 
 # ── PDF ──────────────────────────────────────────────────────────────────────
@@ -69,11 +75,11 @@ def generate_pdf(path: Path) -> None:
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", style="B", size=16)
-    pdf.multi_cell(0, 10, _title())
+    pdf.multi_cell(0, 10, _safe(_title()))
     pdf.ln(4)
     pdf.set_font("Helvetica", size=11)
     for para in _body_paragraphs(5):
-        pdf.multi_cell(0, 7, para)
+        pdf.multi_cell(0, 7, _safe(para))
         pdf.ln(3)
     # Optional table
     pdf.ln(4)
@@ -84,7 +90,7 @@ def generate_pdf(path: Path) -> None:
     pdf.ln()
     pdf.set_font("Helvetica", size=10)
     for _ in range(4):
-        pdf.cell(60, 7, fake.bs(), border=1)
+        pdf.cell(60, 7, _safe(fake.bs()), border=1)
         pdf.cell(40, 7, str(fake.random_int(100, 9999)), border=1)
         pdf.cell(40, 7, str(fake.random_int(100, 9999)), border=1)
         pdf.ln()
@@ -223,7 +229,8 @@ def generate_eml(path: Path) -> None:
         "",
         *[textwrap.fill(p, width=80) for p in _body_paragraphs(3)],
         "",
-        f"Please review the attached {random.choice(TOPICS)} at your earliest convenience.",
+        f"Please review the attached {random.choice(TOPICS)} "
+        "at your earliest convenience.",
         "",
         "Best regards,",
         fake.name(),
@@ -293,7 +300,62 @@ def generate_scanned_image(path: Path) -> None:
     img.save(str(path), format="PNG", optimize=True)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Scanned PDF (image-only, no text layer — forces OCR) ─────────────────────
+
+
+def generate_scanned_pdf(path: Path) -> None:
+    """Create a PDF whose pages are rasterised images with no text layer.
+
+    Simulates invoices or signed contracts scanned to PDF.
+    The pipeline must OCR these; PyMuPDF will extract 0 characters.
+    """
+    img = Image.new("RGB", (1240, 1754), color=(245, 245, 245))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font_title = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28
+        )
+        font_body = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20
+        )
+    except OSError:
+        font_title = ImageFont.load_default()
+        font_body = ImageFont.load_default()
+
+    y = 80
+    draw.text((80, y), _title(), fill=(10, 10, 10), font=font_title)
+    y += 60
+    draw.text(
+        (80, y),
+        f"Invoice #: {fake.bothify('INV-####-??').upper()}   "
+        f"Date: {fake.date_this_decade()}",
+        fill=(60, 60, 60),
+        font=font_body,
+    )
+    y += 50
+
+    for para in _body_paragraphs(5):
+        for line in textwrap.wrap(para, width=85):
+            if y > 1650:
+                break
+            draw.text((80, y), line, fill=(20, 20, 20), font=font_body)
+            y += 28
+        y += 14
+
+    # Embed image into a PDF page with no text layer
+    pdf = FPDF(unit="pt", format=[img.width, img.height])
+    pdf.add_page()
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        img.save(tmp_path, format="PNG")
+        pdf.image(tmp_path, x=0, y=0, w=img.width, h=img.height)
+    finally:
+        import os
+
+        os.unlink(tmp_path)
+    pdf.output(str(path))
 
 
 def main() -> None:
@@ -303,6 +365,7 @@ def main() -> None:
         "xlsx": (generate_xlsx, ".xlsx"),
         "eml": (generate_eml, ".eml"),
         "img": (generate_scanned_image, ".png"),
+        "scanned_pdf": (generate_scanned_pdf, ".pdf"),
     }
 
     for fmt, (fn, ext) in generators.items():
