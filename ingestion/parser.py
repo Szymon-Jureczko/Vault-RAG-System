@@ -97,7 +97,7 @@ def _split_text(
 
     chunks: list[Chunk] = []
     for i in range(0, len(text), chunk_size):
-        segment = text[i:i + chunk_size]
+        segment = text[i : i + chunk_size]
         meta: dict = {
             "source": str(source),
             "filename": source.name,
@@ -157,10 +157,10 @@ class DoclingParser(BaseParser):
 
     @property
     def extensions(self) -> set[str]:
-        return PDF_EXTENSIONS | OFFICE_EXTENSIONS
+        return OFFICE_EXTENSIONS
 
     def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
-        """Parse PDF/DOCX/XLSX using Docling's layout engine.
+        """Parse DOCX using Docling's layout engine.
 
         Args:
             path: Path to the document.
@@ -271,6 +271,8 @@ class PyMuPDFParser(BaseParser):
 class TesseractParser(BaseParser):
     """OCR parser for scanned images using Tesseract."""
 
+    _TESS_CONFIG = "--psm 6 --oem 1"
+
     @property
     def name(self) -> str:
         return "tesseract"
@@ -291,7 +293,7 @@ class TesseractParser(BaseParser):
         """
         try:
             import pytesseract
-            from PIL import Image
+            from PIL import Image, ImageEnhance
         except ImportError as exc:
             return ParserResult(
                 file_path=str(path),
@@ -306,7 +308,10 @@ class TesseractParser(BaseParser):
             max_dim = 2000
             if max(image.size) > max_dim:
                 image.thumbnail((max_dim, max_dim), Image.LANCZOS)
-            text = pytesseract.image_to_string(image)
+            # Grayscale cuts pixel data by 3×; contrast helps faded scans
+            image = image.convert("L")
+            image = ImageEnhance.Contrast(image).enhance(2.0)
+            text = pytesseract.image_to_string(image, config=self._TESS_CONFIG)
             image.close()
             chunks = _split_text(text, path, chunk_size, self.name, page=1)
 
@@ -493,18 +498,126 @@ class EmlParser(BaseParser):
             )
 
 
+# ── Smart PDF parser (text-layer first, per-page OCR fallback) ──────────────
+
+
+class SmartPDFParser(BaseParser):
+    """PDF parser that extracts the text layer first and OCRs only scanned pages.
+
+    For each page, PyMuPDF extracts any embedded text.  If fewer than
+    ``_MIN_TEXT_CHARS`` characters are found the page is rendered to an image
+    and passed to Tesseract.  This means native-text PDFs are near-instant
+    while scanned/image-only PDFs still produce searchable output.
+    """
+
+    _TESS_CONFIG = "--psm 6 --oem 1"
+    _MIN_TEXT_CHARS = 10
+
+    @property
+    def name(self) -> str:
+        return "smart_pdf"
+
+    @property
+    def extensions(self) -> set[str]:
+        return PDF_EXTENSIONS
+
+    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+        """Parse a PDF with automatic text-vs-OCR routing per page.
+
+        Args:
+            path: Path to the PDF file.
+            chunk_size: Approximate characters per chunk.
+
+        Returns:
+            ParserResult with chunks from all pages.
+        """
+        try:
+            import fitz
+        except ImportError as exc:
+            return ParserResult(
+                file_path=str(path),
+                success=False,
+                error=f"PyMuPDF not installed: {exc}",
+                parser_name=self.name,
+            )
+
+        try:
+            from PIL import Image, ImageEnhance
+            import pytesseract
+            ocr_available = True
+        except ImportError:
+            ocr_available = False
+
+        try:
+            doc = fitz.open(str(path))
+            all_chunks: list[Chunk] = []
+            text_pages = 0
+            ocr_pages = 0
+
+            for page_num, page in enumerate(doc, start=1):
+                text = page.get_text().strip()
+                if len(text) >= self._MIN_TEXT_CHARS:
+                    text_pages += 1
+                    all_chunks.extend(
+                        _split_text(text, path, chunk_size, self.name, page=page_num)
+                    )
+                elif ocr_available:
+                    ocr_pages += 1
+                    pix = page.get_pixmap(dpi=150)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    max_dim = 2000
+                    if max(img.size) > max_dim:
+                        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                    img = ImageEnhance.Contrast(img.convert("L")).enhance(2.0)
+                    ocr_text = pytesseract.image_to_string(img, config=self._TESS_CONFIG)
+                    img.close()
+                    all_chunks.extend(
+                        _split_text(
+                            ocr_text, path, chunk_size, self.name, page=page_num
+                        )
+                    )
+
+            page_count = len(doc)
+            doc.close()
+
+            if ocr_pages:
+                logger.info(
+                    "%s: %d text pages, %d OCR pages",
+                    path.name,
+                    text_pages,
+                    ocr_pages,
+                )
+
+            return ParserResult(
+                file_path=str(path),
+                chunks=all_chunks,
+                parser_name=self.name,
+                page_count=page_count,
+                success=True,
+            )
+        except Exception as exc:
+            logger.error("SmartPDFParser failed on %s: %s", path, exc)
+            return ParserResult(
+                file_path=str(path),
+                success=False,
+                error=str(exc),
+                parser_name=self.name,
+            )
+
+
 # ── Dispatcher ──────────────────────────────────────────────────────────────
 
 _PARSERS: list[BaseParser] = [
+    SmartPDFParser(),
     OpenpyxlParser(),
     DoclingParser(),
-    PyMuPDFParser(),
     TesseractParser(),
     TextParser(),
     EmlParser(),
 ]
 
-# Extension → parser lookup (first match wins; Docling for PDFs)
+# Extension → parser lookup (first match wins)
+# PDFs → SmartPDFParser (text-layer fast path, per-page OCR fallback)
 _EXT_MAP: dict[str, BaseParser] = {}
 for _p in _PARSERS:
     for _ext in _p.extensions:

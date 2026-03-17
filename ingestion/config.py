@@ -21,7 +21,8 @@ class Settings(BaseSettings):
         embedding_model: HuggingFace sentence-transformer model name.
         chroma_persist_path: Directory where ChromaDB stores its index.
         state_db_path: Path to the SQLite state-tracking database.
-        max_workers: Max workers for ProcessPoolExecutor (CPU cores).
+        max_workers: Max workers for non-OCR ProcessPoolExecutor (CPU cores).
+        ocr_workers: Max workers for OCR/image ProcessPoolExecutor (memory-constrained).
         batch_commit_size: Number of vectors to buffer before committing
             to ChromaDB.  Also the interval for ``gc.collect()`` calls.
         app_env: Current environment (development / production).
@@ -48,7 +49,8 @@ class Settings(BaseSettings):
     state_db_path: Path = Path("data/state.db")
 
     # ── Concurrency ─────────────────────────────────────────────────────────
-    max_workers: int = 8
+    max_workers: int = 8  # non-OCR parsers (XLSX, EML, PDF, DOCX)
+    ocr_workers: int = 2  # OCR/image parsers (memory-constrained)
 
     # ── Batch / OOM-safety ──────────────────────────────────────────────────
     batch_commit_size: int = 500
