@@ -1,8 +1,10 @@
-"""Ingestion pipeline orchestrator with parallel parsing and batch committing.
+"""Ingestion pipeline orchestrator with two-phase parallel parsing.
 
 Discovers files in ``data/``, checks each against the SQLite state tracker,
-parses new/modified documents via ``ProcessPoolExecutor`` (8 workers max),
-and commits chunks to ChromaDB through a memory-safe batcher.
+then runs two phases: fast formats (PDF, DOCX, XLSX, EML) with ``max_workers``
+and OCR/image formats (PNG, JPEG, etc.) with the smaller ``ocr_workers`` pool.
+Each phase commits to ChromaDB immediately so ``/stats`` shows incremental
+progress rather than staying at 0% for the whole run.
 
 Usage::
 
@@ -23,7 +25,12 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from ingestion.config import settings
-from ingestion.parser import SUPPORTED_EXTENSIONS, ParserResult, parse_file
+from ingestion.parser import (
+    IMAGE_EXTENSIONS,
+    SUPPORTED_EXTENSIONS,
+    ParserResult,
+    parse_file,
+)
 from ingestion.state_tracker import StateTracker, compute_md5
 
 logger = logging.getLogger(__name__)
@@ -82,9 +89,7 @@ class BatchCommitter:
             text: Text content of the chunk.
             metadata: Source metadata dict.
         """
-        self._buffer.append(
-            {"id": chunk_id, "text": text, "metadata": metadata}
-        )
+        self._buffer.append({"id": chunk_id, "text": text, "metadata": metadata})
         if len(self._buffer) >= self._batch_size:
             self.flush()
 
@@ -173,7 +178,8 @@ class IngestionPipeline:
     Args:
         tracker: StateTracker instance (defaults to global settings).
         chroma_path: Path to ChromaDB persistent storage.
-        max_workers: Max parallel parsing workers.
+        max_workers: Max parallel workers for non-OCR parsers.
+        ocr_workers: Max parallel workers for OCR/image parsers.
         batch_size: Chunks per ChromaDB commit batch.
         chunk_size: Target characters per text chunk.
     """
@@ -183,6 +189,7 @@ class IngestionPipeline:
         tracker: StateTracker | None = None,
         chroma_path: Path | None = None,
         max_workers: int | None = None,
+        ocr_workers: int | None = None,
         batch_size: int = 100,
         chunk_size: int = 1000,
     ) -> None:
@@ -190,6 +197,7 @@ class IngestionPipeline:
         self._tracker.init_db()
         self._chroma_path = chroma_path or settings.chroma_persist_path
         self._max_workers = max_workers or settings.max_workers
+        self._ocr_workers = ocr_workers or settings.ocr_workers
         self._batch_size = batch_size
         self._chunk_size = chunk_size
 
@@ -213,9 +221,9 @@ class IngestionPipeline:
 
         # Try ONNX backend first for faster CPU inference
         try:
+            import numpy as np
             from optimum.onnxruntime import ORTModelForFeatureExtraction
             from transformers import AutoTokenizer
-            import numpy as np
 
             tokenizer = AutoTokenizer.from_pretrained(
                 f"sentence-transformers/{settings.embedding_model}"
@@ -228,15 +236,18 @@ class IngestionPipeline:
 
             def embed_fn(texts: list[str]) -> list[list[float]]:
                 encoded = tokenizer(
-                    texts, padding=True, truncation=True,
-                    max_length=512, return_tensors="np",
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="np",
                 )
                 outputs = ort_model(**encoded)
                 # Mean pooling over token embeddings
                 mask = encoded["attention_mask"]
-                embeddings = (
-                    outputs.last_hidden_state * mask[..., np.newaxis]
-                ).sum(axis=1) / mask.sum(axis=-1, keepdims=True)
+                embeddings = (outputs.last_hidden_state * mask[..., np.newaxis]).sum(
+                    axis=1
+                ) / mask.sum(axis=-1, keepdims=True)
                 # Normalize
                 norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
                 embeddings = embeddings / norms
@@ -249,21 +260,77 @@ class IngestionPipeline:
             model = SentenceTransformer(settings.embedding_model)
 
             def embed_fn(texts: list[str]) -> list[list[float]]:
-                return model.encode(
-                    texts, show_progress_bar=False
-                ).tolist()
+                return model.encode(texts, show_progress_bar=False).tolist()
 
         return collection, embed_fn
 
-    def run(self, source_dir: Path) -> IngestionStats:
-        """Execute the full ingestion pipeline.
+    def _run_phase(
+        self,
+        files: list[Path],
+        workers: int,
+        batcher: "BatchCommitter",
+        stats: IngestionStats,
+    ) -> None:
+        """Parse, embed, and commit one phase of files with per-file state updates.
 
-        Steps:
-            1. Discover files with supported extensions.
-            2. Filter unchanged files via state tracker MD5 check.
-            3. Parse changed/new files with ProcessPoolExecutor.
-            4. Batch-commit chunks to ChromaDB.
-            5. Update state tracker with results.
+        Each file is marked ``in_progress`` before its worker starts and
+        transitions to ``completed`` or ``failed`` the moment the future
+        resolves — giving /stats a live count that updates with every file
+        rather than only at the end of the phase.
+
+        Args:
+            files:   Files to process in this phase.
+            workers: Max parallel worker processes for this phase.
+            batcher: Shared BatchCommitter; auto-flushes at batch_size.
+            stats:   Mutable IngestionStats updated in place.
+        """
+        if not files:
+            return
+
+        for fp in files:
+            md5 = compute_md5(fp)
+            self._tracker.mark_in_progress(str(fp), md5)
+
+        actual_workers = min(workers, len(files))
+        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {
+                executor.submit(_worker, str(fp), self._chunk_size): fp
+                for fp in files
+            }
+            for future in as_completed(futures):
+                fp = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logger.error("Worker error for %s: %s", fp, exc)
+                    self._tracker.mark_failed(str(fp), error=str(exc))
+                    stats.failed += 1
+                    continue
+
+                if result.success and result.chunks:
+                    for chunk in result.chunks:
+                        batcher.add(chunk.chunk_id, chunk.text, chunk.metadata)
+                    self._tracker.mark_completed(
+                        str(fp), vector_id=result.chunks[0].chunk_id
+                    )
+                    stats.processed += 1
+                    stats.total_chunks += len(result.chunks)
+                else:
+                    self._tracker.mark_failed(
+                        str(fp), error=result.error or "Unknown error"
+                    )
+                    stats.failed += 1
+
+        batcher.flush()
+
+    def run(self, source_dir: Path) -> IngestionStats:
+        """Execute the two-phase ingestion pipeline.
+
+        Phase 1 processes fast formats (DOCX, XLSX, EML, text-layer PDFs)
+        with ``max_workers`` and commits before Phase 2 starts, so /stats
+        shows incremental progress instead of staying at 0% for the whole run.
+        Phase 2 processes OCR/image files with the smaller ``ocr_workers``
+        pool to stay within memory limits.
 
         Args:
             source_dir: Directory containing documents to ingest.
@@ -294,51 +361,32 @@ class IngestionPipeline:
         if not to_process:
             return stats
 
-        # ── Mark in-progress ────────────────────────────────────────────
-        for fp in to_process:
-            md5 = compute_md5(fp)
-            self._tracker.mark_in_progress(str(fp), md5)
+        # ── Split into fast vs OCR file lists ───────────────────────────
+        fast_files = [
+            fp for fp in to_process if fp.suffix.lower() not in IMAGE_EXTENSIONS
+        ]
+        ocr_files = [fp for fp in to_process if fp.suffix.lower() in IMAGE_EXTENSIONS]
 
-        # ── Parse in parallel ───────────────────────────────────────────
-        workers = min(self._max_workers, len(to_process))
-        results: dict[str, ParserResult] = {}
-
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(_worker, str(fp), self._chunk_size): fp
-                for fp in to_process
-            }
-            for future in as_completed(futures):
-                fp = futures[future]
-                try:
-                    results[str(fp)] = future.result()
-                except Exception as exc:
-                    logger.error("Worker error for %s: %s", fp, exc)
-                    results[str(fp)] = ParserResult(
-                        file_path=str(fp), success=False, error=str(exc)
-                    )
-
-        # ── Commit to ChromaDB ──────────────────────────────────────────
+        # ── Shared batcher (initialised once, used across both phases) ──
         collection, embed_fn = self._init_chroma()
-        batcher = BatchCommitter(
-            collection, embed_fn, batch_size=self._batch_size
-        )
+        batcher = BatchCommitter(collection, embed_fn, batch_size=self._batch_size)
 
-        for fp in to_process:
-            result = results[str(fp)]
-            if result.success and result.chunks:
-                for chunk in result.chunks:
-                    batcher.add(chunk.chunk_id, chunk.text, chunk.metadata)
-                self._tracker.mark_completed(
-                    str(fp), vector_id=result.chunks[0].chunk_id
-                )
-                stats.processed += 1
-                stats.total_chunks += len(result.chunks)
-            else:
-                self._tracker.mark_failed(
-                    str(fp), error=result.error or "Unknown error"
-                )
-                stats.failed += 1
+        # ── Phase 1: fast formats ────────────────────────────────────────
+        logger.info(
+            "Phase 1 start: %d fast files with %d workers",
+            len(fast_files),
+            self._max_workers,
+        )
+        self._run_phase(fast_files, self._max_workers, batcher, stats)
+
+        # ── Phase 2: OCR / image files ──────────────────────────────────
+        if ocr_files:
+            logger.info(
+                "Phase 2 start: %d OCR files with %d workers",
+                len(ocr_files),
+                self._ocr_workers,
+            )
+            self._run_phase(ocr_files, self._ocr_workers, batcher, stats)
 
         batcher.finalize()
 
