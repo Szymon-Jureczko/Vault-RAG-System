@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from ingestion.config import settings
 from ingestion.pipeline import IngestionPipeline, IngestionStats
+from ingestion.state_tracker import StateTracker
 from vector_db.retriever import HybridRetriever, RetrievalResult
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,26 @@ class SyncResponse(BaseModel):
     status: str
     job_id: str = ""
     stats: IngestionStats | None = None
+
+
+class StatsResponse(BaseModel):
+    """Live ingestion progress from the state DB.
+
+    Attributes:
+        pending: Files not yet processed.
+        in_progress: Files currently being parsed.
+        completed: Successfully ingested files.
+        failed: Files that errored during ingestion.
+        total: Sum of all statuses.
+        progress_pct: Percentage of non-pending files completed.
+    """
+
+    pending: int = 0
+    in_progress: int = 0
+    completed: int = 0
+    failed: int = 0
+    total: int = 0
+    progress_pct: float = 0.0
 
 
 # ── Background job store ──────────────────────────────────────────────────
@@ -174,13 +195,16 @@ def sync_documents(request: SyncRequest) -> SyncResponse:
             stats = pipeline.run(source)
             with _sync_lock:
                 _sync_jobs[job_id] = SyncResponse(
-                    status="completed", job_id=job_id, stats=stats,
+                    status="completed",
+                    job_id=job_id,
+                    stats=stats,
                 )
         except Exception as exc:
             logger.error("Sync job %s failed: %s", job_id, exc)
             with _sync_lock:
                 _sync_jobs[job_id] = SyncResponse(
-                    status=f"failed: {exc}", job_id=job_id,
+                    status=f"failed: {exc}",
+                    job_id=job_id,
                 )
 
     thread = threading.Thread(target=_run_sync, daemon=True)
@@ -204,6 +228,31 @@ def sync_status(job_id: str) -> SyncResponse:
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
     return job
+
+
+@app.get("/stats", response_model=StatsResponse)
+def ingestion_stats() -> StatsResponse:
+    """Return live ingestion progress from the state DB.
+
+    Reads counts directly from SQLite so results are real-time even
+    while a background sync job is running.
+
+    Returns:
+        StatsResponse with per-status counts and overall progress %.
+    """
+    tracker = StateTracker(settings.state_db_path)
+    counts = tracker.summary()
+    total = sum(counts.values())
+    completed = counts.get("completed", 0)
+    progress_pct = round(completed / total * 100, 1) if total else 0.0
+    return StatsResponse(
+        pending=counts.get("pending", 0),
+        in_progress=counts.get("in_progress", 0),
+        completed=completed,
+        failed=counts.get("failed", 0),
+        total=total,
+        progress_pct=progress_pct,
+    )
 
 
 @app.post("/query", response_model=QueryResponse)
