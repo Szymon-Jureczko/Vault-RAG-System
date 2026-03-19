@@ -66,7 +66,7 @@ class Settings(BaseSettings):
 
     @property
     def active_model(self) -> str:
-        """Return the LLM model name appropriate for the current environment."""
+        """Return the active LLM model name for the current environment."""
         return self.ollama_model_dev if self.is_dev else self.ollama_model_eval
 
 
