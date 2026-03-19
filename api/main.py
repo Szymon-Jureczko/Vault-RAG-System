@@ -193,6 +193,7 @@ def sync_documents(request: SyncRequest) -> SyncResponse:
         try:
             pipeline = _get_pipeline()
             stats = pipeline.run(source)
+            _get_retriever().refresh_index()
             with _sync_lock:
                 _sync_jobs[job_id] = SyncResponse(
                     status="completed",

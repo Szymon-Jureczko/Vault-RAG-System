@@ -16,3 +16,9 @@
 - **LLM:** Ollama (`llama3.2:3b` for dev, `8b` for evaluation).
 - **Embeddings:** HuggingFace `all-MiniLM-L6-v2` (Best latency/RAM trade-off).
 - **Vector DB:** ChromaDB (Persistent Disk Mode).
+
+# General Workspace Rules for Copilot
+1. NEVER suggest or run terminal commands like `find`, `ls -R`, or `tree` on the `data/` directory. It contains thousands of files and will crash the VS Code extension host.
+2. NEVER attempt to automatically resolve git conflicts or run `git merge` commands. 
+3. If I ask for help with a Git conflict, just output the corrected code in a markdown block so I can copy/paste it myself.
+4. Assume all database files are off-limits for context gathering.

@@ -27,8 +27,10 @@ from pydantic import BaseModel
 from ingestion.config import settings
 from ingestion.parser import (
     IMAGE_EXTENSIONS,
+    PDF_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
     ParserResult,
+    is_scanned_pdf,
     parse_file,
 )
 from ingestion.state_tracker import StateTracker, compute_md5
@@ -239,13 +241,22 @@ class IngestionPipeline:
             from optimum.onnxruntime import ORTModelForFeatureExtraction
             from transformers import AutoTokenizer
 
-            tokenizer = AutoTokenizer.from_pretrained(
-                f"sentence-transformers/{settings.embedding_model}"
-            )
-            ort_model = ORTModelForFeatureExtraction.from_pretrained(
-                f"sentence-transformers/{settings.embedding_model}",
-                export=True,
-            )
+            _hub_id = f"sentence-transformers/{settings.embedding_model}"
+            _onnx_cache = self._chroma_path.parent / "onnx" / settings.embedding_model
+            if _onnx_cache.exists():
+                tokenizer = AutoTokenizer.from_pretrained(str(_onnx_cache))
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                    str(_onnx_cache)
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(_hub_id)
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                    _hub_id, export=True
+                )
+                _onnx_cache.mkdir(parents=True, exist_ok=True)
+                tokenizer.save_pretrained(str(_onnx_cache))
+                ort_model.save_pretrained(str(_onnx_cache))
+                logger.info("ONNX model cached at %s", _onnx_cache)
             logger.info("Using ONNX runtime for embeddings")
 
             def embed_fn(texts: list[str]) -> list[list[float]]:
@@ -329,6 +340,11 @@ class IngestionPipeline:
                     )
                     stats.processed += 1
                     stats.total_chunks += len(result.chunks)
+                elif result.success:
+                    # Gated/skipped file (e.g. tiny image) — no
+                    # chunks produced but not an error.
+                    self._tracker.mark_completed(str(fp))
+                    stats.skipped_unchanged += 1
                 else:
                     self._tracker.mark_failed(
                         str(fp), error=result.error or "Unknown error"
@@ -340,11 +356,14 @@ class IngestionPipeline:
     def run(self, source_dir: Path) -> IngestionStats:
         """Execute the two-phase ingestion pipeline.
 
+        First purges stale state-DB records and ChromaDB chunks for files
+        that have been deleted from disk.
+
         Phase 1 processes fast formats (DOCX, XLSX, EML, text-layer PDFs)
-        with ``max_workers`` and commits before Phase 2 starts, so /stats
-        shows incremental progress instead of staying at 0% for the whole run.
-        Phase 2 processes OCR/image files with the smaller ``ocr_workers``
-        pool to stay within memory limits.
+        with ``max_workers``.  Phase 2 processes OCR-heavy files (images
+        and scanned PDFs) with the smaller ``ocr_workers`` pool.  Scanned
+        PDFs are identified up-front via a cheap text-density probe
+        (~5-20 ms each) so they never block the fast worker pool.
 
         Args:
             source_dir: Directory containing documents to ingest.
@@ -359,6 +378,10 @@ class IngestionPipeline:
         stats.total_discovered = len(all_files)
         logger.info("Discovered %d files in %s", len(all_files), source_dir)
 
+        # ── Purge stale records for deleted files ──────────────────────
+        known_paths = {str(fp) for fp in all_files}
+        stale_paths = self._tracker.purge_deleted(known_paths)
+
         # ── Filter unchanged ────────────────────────────────────────────
         to_process: list[Path] = []
         for fp in all_files:
@@ -372,18 +395,35 @@ class IngestionPipeline:
             len(to_process),
             stats.skipped_unchanged,
         )
-        if not to_process:
+        if not to_process and not stale_paths:
             return stats
 
         # ── Split into fast vs OCR file lists ───────────────────────────
-        fast_files = [
-            fp for fp in to_process if fp.suffix.lower() not in IMAGE_EXTENSIONS
-        ]
-        ocr_files = [fp for fp in to_process if fp.suffix.lower() in IMAGE_EXTENSIONS]
+        # Images always go to Phase 2 (OCR).
+        # PDFs are probed: scanned PDFs go to Phase 2, text PDFs to Phase 1.
+        fast_files: list[Path] = []
+        ocr_files: list[Path] = []
+        for fp in to_process:
+            ext = fp.suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                ocr_files.append(fp)
+            elif ext in PDF_EXTENSIONS and is_scanned_pdf(fp):
+                ocr_files.append(fp)
+            else:
+                fast_files.append(fp)
 
         # ── Shared batcher (initialised once, used across both phases) ──
         collection, embed_fn = self._init_chroma()
         batcher = BatchCommitter(collection, embed_fn, batch_size=self._batch_size)
+
+        # ── Clean up ChromaDB chunks for deleted files ─────────────────
+        for sp in stale_paths:
+            batcher.delete_for_file(Path(sp).name)
+        if stale_paths:
+            logger.info(
+                "Purged ChromaDB chunks for %d deleted files",
+                len(stale_paths),
+            )
 
         # ── Phase 1: fast formats ────────────────────────────────────────
         logger.info(

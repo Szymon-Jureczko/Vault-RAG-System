@@ -283,6 +283,31 @@ class StateTracker:
         )
         self.conn.commit()
 
+    # ── purge ──────────────────────────────────────────────────────────────
+
+    def purge_deleted(self, known_paths: set[str]) -> list[str]:
+        """Remove state records for files no longer present on disk.
+
+        Args:
+            known_paths: Set of string paths currently on disk.
+
+        Returns:
+            List of file paths that were removed from the state DB.
+        """
+        rows = self.conn.execute("SELECT file_path FROM file_state").fetchall()
+        stale = [
+            row["file_path"] for row in rows if row["file_path"] not in known_paths
+        ]
+        if not stale:
+            return []
+        self.conn.executemany(
+            "DELETE FROM file_state WHERE file_path = ?",
+            [(p,) for p in stale],
+        )
+        self.conn.commit()
+        logger.info("Purged %d stale records from state DB", len(stale))
+        return stale
+
     # ── stats ───────────────────────────────────────────────────────────────
 
     def summary(self) -> dict[str, int]:

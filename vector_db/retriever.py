@@ -24,6 +24,7 @@ import pickle
 from pathlib import Path
 
 import chromadb
+import numpy as np
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -85,7 +86,7 @@ class HybridRetriever:
         collection_name: str = "localvault_docs",
     ) -> None:
         chroma_path = chroma_path or settings.chroma_persist_path
-        self._embedder = SentenceTransformer(
+        self._embedder = self._init_embedder(
             embedding_model or settings.embedding_model
         )
         self._reranker = CrossEncoder(reranker_model or self._RERANKER_MODEL)
@@ -101,6 +102,74 @@ class HybridRetriever:
         self._corpus_texts: list[str] = []
         self._corpus_metas: list[dict] = []
         self._bm25_index_path = Path(str(chroma_path)) / "bm25_index.pkl"
+
+    @staticmethod
+    def _init_embedder(model_name: str):
+        """Initialise embedding backend (ONNX-first, PyTorch fallback).
+
+        Mirrors the ingestion pipeline strategy so query and document
+        embeddings are numerically identical.
+        """
+        hub_id = f"sentence-transformers/{model_name}"
+        onnx_cache = (
+            settings.chroma_persist_path.parent / "onnx" / model_name
+        )
+        try:
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from transformers import AutoTokenizer
+
+            if onnx_cache.exists():
+                tokenizer = AutoTokenizer.from_pretrained(
+                    str(onnx_cache)
+                )
+                ort_model = (
+                    ORTModelForFeatureExtraction.from_pretrained(
+                        str(onnx_cache)
+                    )
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(hub_id)
+                ort_model = (
+                    ORTModelForFeatureExtraction.from_pretrained(
+                        hub_id, export=True
+                    )
+                )
+                onnx_cache.mkdir(parents=True, exist_ok=True)
+                tokenizer.save_pretrained(str(onnx_cache))
+                ort_model.save_pretrained(str(onnx_cache))
+            logger.info("Retriever using ONNX runtime for embeddings")
+
+            class _OnnxEmbedder:
+                """Thin wrapper matching SentenceTransformer.encode()."""
+
+                def __init__(self, tok, mdl):
+                    self._tok = tok
+                    self._mdl = mdl
+
+                def encode(self, texts, **_kw):
+                    enc = self._tok(
+                        texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                        return_tensors="np",
+                    )
+                    out = self._mdl(**enc)
+                    mask = enc["attention_mask"]
+                    emb = (
+                        out.last_hidden_state * mask[..., np.newaxis]
+                    ).sum(axis=1) / mask.sum(
+                        axis=-1, keepdims=True
+                    )
+                    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+                    return emb / norms
+
+            return _OnnxEmbedder(tokenizer, ort_model)
+        except Exception as exc:
+            logger.info(
+                "ONNX unavailable (%s), using PyTorch", exc
+            )
+            return SentenceTransformer(model_name)
 
     def _build_bm25_index(self) -> None:
         """Build/rebuild the BM25 index from all documents in ChromaDB."""
@@ -155,14 +224,10 @@ class HybridRetriever:
             self._corpus_texts = payload["texts"]
             self._corpus_metas = payload["metas"]
             self._bm25 = payload["bm25"]
-            logger.info(
-                "BM25 index loaded from disk (%d docs)", chroma_count
-            )
+            logger.info("BM25 index loaded from disk (%d docs)", chroma_count)
             return True
         except Exception as exc:
-            logger.warning(
-                "Could not load BM25 index: %s — rebuilding", exc
-            )
+            logger.warning("Could not load BM25 index: %s — rebuilding", exc)
             return False
 
     def _load_or_build_bm25_index(self) -> None:
@@ -171,9 +236,7 @@ class HybridRetriever:
             if self._collection.count() > 0:
                 self._build_bm25_index()
             else:
-                logger.info(
-                    "ChromaDB collection is empty — BM25 index deferred"
-                )
+                logger.info("ChromaDB collection is empty — BM25 index deferred")
 
     def _semantic_search(
         self, query: str, n_results: int
@@ -189,7 +252,9 @@ class HybridRetriever:
         """
         embedding = self._embedder.encode(
             [query], show_progress_bar=False
-        ).tolist()
+        )
+        if hasattr(embedding, "tolist"):
+            embedding = embedding.tolist()
         results = self._collection.query(
             query_embeddings=embedding,
             n_results=min(n_results, self._collection.count()),
@@ -198,12 +263,14 @@ class HybridRetriever:
 
         items = []
         for i in range(len(results["ids"][0])):
-            items.append((
-                results["ids"][0][i],
-                results["documents"][0][i],
-                results["metadatas"][0][i],
-                results["distances"][0][i],
-            ))
+            items.append(
+                (
+                    results["ids"][0][i],
+                    results["documents"][0][i],
+                    results["metadatas"][0][i],
+                    results["distances"][0][i],
+                )
+            )
         return items
 
     def _bm25_search(
@@ -224,19 +291,21 @@ class HybridRetriever:
         tokens = query.lower().split()
         scores = self._bm25.get_scores(tokens)
 
-        top_indices = sorted(
-            range(len(scores)), key=lambda i: scores[i], reverse=True
-        )[:n_results]
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
+            :n_results
+        ]
 
         items = []
         for idx in top_indices:
             if scores[idx] > 0:
-                items.append((
-                    self._corpus_ids[idx],
-                    self._corpus_texts[idx],
-                    self._corpus_metas[idx],
-                    float(scores[idx]),
-                ))
+                items.append(
+                    (
+                        self._corpus_ids[idx],
+                        self._corpus_texts[idx],
+                        self._corpus_metas[idx],
+                        float(scores[idx]),
+                    )
+                )
         return items
 
     @staticmethod
@@ -345,7 +414,8 @@ class HybridRetriever:
 
         # Step 1 & 2: Parallel retrieval
         semantic_results = self._semantic_search(
-            query_text, semantic_candidates,
+            query_text,
+            semantic_candidates,
         )
         bm25_results = self._bm25_search(query_text, bm25_candidates)
 
@@ -368,8 +438,7 @@ class HybridRetriever:
             )
 
         logger.info(
-            "Query returned %d results "
-            "(from %d semantic + %d BM25 candidates)",
+            "Query returned %d results " "(from %d semantic + %d BM25 candidates)",
             len(results),
             len(semantic_results),
             len(bm25_results),

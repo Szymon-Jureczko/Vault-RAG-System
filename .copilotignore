@@ -1,0 +1,5 @@
+data/chroma/**
+data/test_docs/**
+*.db
+*.sqlite
+*.pkl

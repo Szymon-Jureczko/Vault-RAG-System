@@ -1,8 +1,9 @@
-"""Multimodal document parsers — Docling, PyMuPDF, Tesseract OCR.
+"""Multimodal document parsers — PyMuPDF, Docling+RapidOCR, RapidOCR.
 
 Provides layout-aware parsing (Docling) for table-to-markdown reconstruction,
-fast PDF extraction (PyMuPDF), and OCR for scanned images (Tesseract).
-Each parser returns a list of text chunks with source metadata.
+fast PDF extraction (PyMuPDF), and OCR for scanned images (RapidOCR via
+ONNX Runtime).  Each parser returns a list of text chunks with source
+metadata.
 
 Usage::
 
@@ -31,6 +32,14 @@ TEXT_EXTENSIONS = {".txt", ".md", ".rst", ".csv", ".json", ".xml", ".html"}
 OFFICE_EXTENSIONS = {".docx"}
 XLSX_EXTENSIONS = {".xlsx"}
 EML_EXTENSIONS = {".eml"}
+
+# ── OCR gating constants ────────────────────────────────────────────────────
+_OCR_MIN_FILE_BYTES: int = 10_000  # skip images < 10 KB
+_OCR_VARIANCE_THRESHOLD: float = 100.0  # skip near-blank/solid-colour images
+_OCR_TARGET_WIDTH: int = 1800  # rescale to ~300 DPI equivalent
+
+# ── PDF text-density probe ──────────────────────────────────────────────────
+_PDF_TEXT_THRESHOLD: int = 50  # avg chars/page below this → scanned
 
 
 class Chunk(BaseModel):
@@ -265,24 +274,113 @@ class PyMuPDFParser(BaseParser):
             )
 
 
-# ── Tesseract OCR parser ───────────────────────────────────────────────────
+# ── Scanned PDF parser (Docling + RapidOCR) ────────────────────────────────
 
 
-class TesseractParser(BaseParser):
-    """OCR parser for scanned images using Tesseract."""
+class ScannedPDFParser(BaseParser):
+    """Parser for scanned PDFs using Docling with RapidOCR.
 
-    _TESS_CONFIG = "--psm 6 --oem 1"
+    Uses ``RapidOcrOptions`` so Docling's internal OCR uses RapidOCR
+    (ONNX Runtime) instead of Tesseract.  The ``DocumentConverter`` is
+    lazily initialised once per process and cached to avoid reloading
+    ONNX models per file.
+    """
+
+    _converter = None  # class-level lazy singleton
+
+    @classmethod
+    def _get_converter(cls):
+        if cls._converter is None:
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import (
+                PdfPipelineOptions,
+                RapidOcrOptions,
+            )
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+
+            pipeline_options = PdfPipelineOptions(
+                do_ocr=True,
+                ocr_options=RapidOcrOptions(),
+            )
+            cls._converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                }
+            )
+        return cls._converter
 
     @property
     def name(self) -> str:
-        return "tesseract"
+        return "scanned_pdf"
+
+    @property
+    def extensions(self) -> set[str]:
+        return PDF_EXTENSIONS
+
+    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+        """Extract text from a scanned PDF using Docling + RapidOCR.
+
+        Args:
+            path: Path to the PDF file.
+            chunk_size: Approximate characters per chunk.
+
+        Returns:
+            ParserResult with OCR-extracted chunks.
+        """
+        try:
+            conv = self._get_converter().convert(str(path))
+            text = conv.document.export_to_markdown()
+            page_count = (
+                len(conv.document.pages) if hasattr(conv.document, "pages") else 0
+            )
+            chunks = _split_text(text, path, chunk_size, self.name)
+            return ParserResult(
+                file_path=str(path),
+                chunks=chunks,
+                parser_name=self.name,
+                page_count=page_count,
+                success=True,
+            )
+        except Exception as exc:
+            logger.error("ScannedPDFParser failed on %s: %s", path, exc)
+            return ParserResult(
+                file_path=str(path),
+                success=False,
+                error=str(exc),
+                parser_name=self.name,
+            )
+
+
+# ── RapidOCR parser (images, replaces Tesseract) ──────────────────────────
+
+
+class RapidOCRParser(BaseParser):
+    """OCR parser for scanned images using RapidOCR (ONNX Runtime).
+
+    Replaces TesseractParser with in-process inference (no subprocess
+    overhead) and two fast gates to skip non-text images.
+    """
+
+    _engine = None  # class-level lazy singleton per process
+
+    @classmethod
+    def _get_engine(cls):
+        if cls._engine is None:
+            from rapidocr_onnxruntime import RapidOCR
+
+            cls._engine = RapidOCR()
+        return cls._engine
+
+    @property
+    def name(self) -> str:
+        return "rapidocr"
 
     @property
     def extensions(self) -> set[str]:
         return IMAGE_EXTENSIONS
 
     def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
-        """Extract text from images via Tesseract OCR.
+        """Extract text from an image using RapidOCR.
 
         Args:
             path: Path to the image file.
@@ -292,27 +390,51 @@ class TesseractParser(BaseParser):
             ParserResult with OCR-extracted chunks.
         """
         try:
-            import pytesseract
-            from PIL import Image, ImageEnhance
+            import numpy as np
+            from PIL import Image
         except ImportError as exc:
             return ParserResult(
                 file_path=str(path),
                 success=False,
-                error=f"pytesseract/Pillow not installed: {exc}",
+                error=f"numpy/Pillow not installed: {exc}",
                 parser_name=self.name,
             )
 
         try:
+            # Gate 1: skip tiny files (icons, bullets, decorative)
+            if path.stat().st_size < _OCR_MIN_FILE_BYTES:
+                logger.debug("Skipping OCR on undersized image %s", path)
+                return ParserResult(
+                    file_path=str(path),
+                    chunks=[],
+                    parser_name=self.name,
+                    page_count=1,
+                    success=True,
+                )
+
             image = Image.open(path)
-            # Resize large images to prevent OOM in worker processes
-            max_dim = 2000
-            if max(image.size) > max_dim:
-                image.thumbnail((max_dim, max_dim), Image.LANCZOS)
-            # Grayscale cuts pixel data by 3×; contrast helps faded scans
-            image = image.convert("L")
-            image = ImageEnhance.Contrast(image).enhance(2.0)
-            text = pytesseract.image_to_string(image, config=self._TESS_CONFIG)
-            image.close()
+
+            # Gate 2: pixel-variance — blank/solid-colour images
+            gray_arr = np.array(image.convert("L"))
+            if float(gray_arr.var()) < _OCR_VARIANCE_THRESHOLD:
+                logger.debug("OCR skipped: low-variance image %s", path)
+                return ParserResult(
+                    file_path=str(path),
+                    chunks=[],
+                    parser_name=self.name,
+                    page_count=1,
+                    success=True,
+                )
+
+            # Preprocessing: greyscale + rescale to optimal OCR width
+            gray = image.convert("L")
+            w, h = gray.size
+            if w < 800 or w > 3000:
+                scale = _OCR_TARGET_WIDTH / w
+                gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+            result, _ = self._get_engine()(np.array(gray))
+            text = "\n".join(line[1] for line in result) if result else ""
             chunks = _split_text(text, path, chunk_size, self.name, page=1)
 
             return ParserResult(
@@ -323,7 +445,7 @@ class TesseractParser(BaseParser):
                 success=True,
             )
         except Exception as exc:
-            logger.error("Tesseract failed on %s: %s", path, exc)
+            logger.error("RapidOCR failed on %s: %s", path, exc)
             return ParserResult(
                 file_path=str(path),
                 success=False,
@@ -498,137 +620,63 @@ class EmlParser(BaseParser):
             )
 
 
-# ── Smart PDF parser (text-layer first, per-page OCR fallback) ──────────────
+# ── PDF text-density probe ──────────────────────────────────────────────────
 
 
-class SmartPDFParser(BaseParser):
-    """PDF parser that extracts the text layer first and OCRs only scanned pages.
+def is_scanned_pdf(file_path: Path) -> bool:
+    """Probe PDF text density to decide whether OCR is needed.
 
-    For each page, PyMuPDF extracts any embedded text.  If fewer than
-    ``_MIN_TEXT_CHARS`` characters are found the page is rendered to an image
-    and passed to Tesseract.  This means native-text PDFs are near-instant
-    while scanned/image-only PDFs still produce searchable output.
+    Opens the file, extracts raw text from all pages, and returns True
+    if the average character count per page is below
+    ``_PDF_TEXT_THRESHOLD``.  The probe costs ~5-20 ms versus 1-30 s
+    for a full OCR pass.
+
+    Args:
+        file_path: Path to the PDF.
+
+    Returns:
+        True if the PDF is likely scanned / requires OCR.
     """
+    try:
+        import fitz
 
-    _TESS_CONFIG = "--psm 6 --oem 1"
-    _MIN_TEXT_CHARS = 10
-
-    @property
-    def name(self) -> str:
-        return "smart_pdf"
-
-    @property
-    def extensions(self) -> set[str]:
-        return PDF_EXTENSIONS
-
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
-        """Parse a PDF with automatic text-vs-OCR routing per page.
-
-        Args:
-            path: Path to the PDF file.
-            chunk_size: Approximate characters per chunk.
-
-        Returns:
-            ParserResult with chunks from all pages.
-        """
-        try:
-            import fitz
-        except ImportError as exc:
-            return ParserResult(
-                file_path=str(path),
-                success=False,
-                error=f"PyMuPDF not installed: {exc}",
-                parser_name=self.name,
-            )
-
-        try:
-            from PIL import Image, ImageEnhance
-            import pytesseract
-            ocr_available = True
-        except ImportError:
-            ocr_available = False
-
-        try:
-            doc = fitz.open(str(path))
-            all_chunks: list[Chunk] = []
-            text_pages = 0
-            ocr_pages = 0
-
-            for page_num, page in enumerate(doc, start=1):
-                text = page.get_text().strip()
-                if len(text) >= self._MIN_TEXT_CHARS:
-                    text_pages += 1
-                    all_chunks.extend(
-                        _split_text(text, path, chunk_size, self.name, page=page_num)
-                    )
-                elif ocr_available:
-                    ocr_pages += 1
-                    pix = page.get_pixmap(dpi=150)
-                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                    max_dim = 2000
-                    if max(img.size) > max_dim:
-                        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-                    img = ImageEnhance.Contrast(img.convert("L")).enhance(2.0)
-                    ocr_text = pytesseract.image_to_string(img, config=self._TESS_CONFIG)
-                    img.close()
-                    all_chunks.extend(
-                        _split_text(
-                            ocr_text, path, chunk_size, self.name, page=page_num
-                        )
-                    )
-
-            page_count = len(doc)
-            doc.close()
-
-            if ocr_pages:
-                logger.info(
-                    "%s: %d text pages, %d OCR pages",
-                    path.name,
-                    text_pages,
-                    ocr_pages,
-                )
-
-            return ParserResult(
-                file_path=str(path),
-                chunks=all_chunks,
-                parser_name=self.name,
-                page_count=page_count,
-                success=True,
-            )
-        except Exception as exc:
-            logger.error("SmartPDFParser failed on %s: %s", path, exc)
-            return ParserResult(
-                file_path=str(path),
-                success=False,
-                error=str(exc),
-                parser_name=self.name,
-            )
+        doc = fitz.open(str(file_path))
+        total_chars = sum(len(page.get_text().strip()) for page in doc)
+        avg = total_chars / max(len(doc), 1)
+        doc.close()
+        return avg < _PDF_TEXT_THRESHOLD
+    except Exception:
+        return True  # assume scanned — OCR attempt is safer than losing content
 
 
 # ── Dispatcher ──────────────────────────────────────────────────────────────
 
+# Non-PDF parsers — PDFs are routed dynamically by parse_file().
 _PARSERS: list[BaseParser] = [
-    SmartPDFParser(),
     OpenpyxlParser(),
     DoclingParser(),
-    TesseractParser(),
+    RapidOCRParser(),
     TextParser(),
     EmlParser(),
 ]
 
-# Extension → parser lookup (first match wins)
-# PDFs → SmartPDFParser (text-layer fast path, per-page OCR fallback)
 _EXT_MAP: dict[str, BaseParser] = {}
 for _p in _PARSERS:
     for _ext in _p.extensions:
         if _ext not in _EXT_MAP:
             _EXT_MAP[_ext] = _p
 
-SUPPORTED_EXTENSIONS = set(_EXT_MAP.keys())
+SUPPORTED_EXTENSIONS = set(_EXT_MAP.keys()) | PDF_EXTENSIONS
 
 
 def parse_file(path: Path, chunk_size: int = 1000) -> ParserResult:
     """Parse a file using the best available parser.
+
+    PDFs are routed via a cheap text-density probe:
+    - Text-layer PDFs  -> ``PyMuPDFParser`` (fast, no OCR)
+    - Scanned PDFs     -> ``ScannedPDFParser`` (Docling + RapidOCR)
+
+    All other files are routed by extension via ``_EXT_MAP``.
 
     Args:
         path: Path to the source document.
@@ -638,7 +686,15 @@ def parse_file(path: Path, chunk_size: int = 1000) -> ParserResult:
         ParserResult from the matched parser.
     """
     ext = path.suffix.lower()
-    parser = _EXT_MAP.get(ext)
+
+    if ext in PDF_EXTENSIONS:
+        if is_scanned_pdf(path):
+            parser: BaseParser = ScannedPDFParser()
+        else:
+            parser = PyMuPDFParser()
+    else:
+        parser = _EXT_MAP.get(ext)  # type: ignore[assignment]
+
     if parser is None:
         return ParserResult(
             file_path=str(path),
