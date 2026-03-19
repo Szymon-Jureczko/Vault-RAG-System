@@ -81,6 +81,20 @@ class BatchCommitter:
         self._buffer: list[dict] = []
         self._total_committed: int = 0
 
+    def delete_for_file(self, filename: str) -> None:
+        """Delete all existing chunks for a file before re-ingesting.
+
+        This prevents stale chunks from a previous ingestion from
+        persisting alongside new ones when a file's content changes.
+
+        Args:
+            filename: Bare filename (e.g. ``"report.docx"``).
+        """
+        try:
+            self._collection.delete(where={"filename": filename})
+        except Exception as exc:
+            logger.warning("Could not delete old chunks for %s: %s", filename, exc)
+
     def add(self, chunk_id: str, text: str, metadata: dict) -> None:
         """Buffer a single chunk for insertion.
 
@@ -294,8 +308,7 @@ class IngestionPipeline:
         actual_workers = min(workers, len(files))
         with ProcessPoolExecutor(max_workers=actual_workers) as executor:
             futures = {
-                executor.submit(_worker, str(fp), self._chunk_size): fp
-                for fp in files
+                executor.submit(_worker, str(fp), self._chunk_size): fp for fp in files
             }
             for future in as_completed(futures):
                 fp = futures[future]
@@ -308,6 +321,7 @@ class IngestionPipeline:
                     continue
 
                 if result.success and result.chunks:
+                    batcher.delete_for_file(fp.name)
                     for chunk in result.chunks:
                         batcher.add(chunk.chunk_id, chunk.text, chunk.metadata)
                     self._tracker.mark_completed(
