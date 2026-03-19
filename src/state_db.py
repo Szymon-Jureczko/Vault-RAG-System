@@ -30,6 +30,17 @@ CREATE TABLE IF NOT EXISTS tracked_files (
 );
 """
 
+_CREATE_OCR_CACHE_SQL = """
+CREATE TABLE IF NOT EXISTS ocr_cache (
+    md5_hash       TEXT PRIMARY KEY,
+    extracted_text TEXT    NOT NULL,
+    parser_used    TEXT    NOT NULL DEFAULT 'rapidocr',
+    created_at     TEXT    NOT NULL,
+    accessed_at    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ocr_cache_accessed ON ocr_cache(accessed_at);
+"""
+
 _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_tracked_files_status ON tracked_files(status);
 """
@@ -71,6 +82,7 @@ class StateDB:
         with self._conn:
             self._conn.execute(_CREATE_TABLE_SQL)
             self._conn.execute(_CREATE_INDEX_SQL)
+            self._conn.executescript(_CREATE_OCR_CACHE_SQL)
 
     def close(self) -> None:
         """Close the database connection."""
@@ -206,6 +218,59 @@ class StateDB:
                 (FileStatus.PENDING.value, now, FileStatus.FAILED.value),
             )
         return cur.rowcount
+
+    def get_ocr_cache(self, md5_hash: str) -> str | None:
+        """Return cached OCR text for a file hash, or None on cache miss.
+
+        Also updates ``accessed_at`` for LRU-style eviction tracking.
+
+        Args:
+            md5_hash: MD5 hex-digest of the source file.
+
+        Returns:
+            Previously extracted text, or None if not cached.
+        """
+        row = self._conn.execute(
+            "SELECT extracted_text FROM ocr_cache WHERE md5_hash = ?",
+            (md5_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE ocr_cache SET accessed_at = ? WHERE md5_hash = ?",
+                (now, md5_hash),
+            )
+        return row["extracted_text"]
+
+    def put_ocr_cache(
+        self, md5_hash: str, text: str, parser_used: str = "rapidocr"
+    ) -> None:
+        """Store OCR-extracted text keyed by file MD5 hash.
+
+        On conflict (same hash re-ingested), the existing entry is updated.
+
+        Args:
+            md5_hash: MD5 hex-digest of the source file.
+            text: Full extracted text to cache.
+            parser_used: Name of the OCR parser that produced the text.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO ocr_cache
+                    (md5_hash, extracted_text, parser_used,
+                     created_at, accessed_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(md5_hash) DO UPDATE SET
+                    extracted_text = excluded.extracted_text,
+                    parser_used    = excluded.parser_used,
+                    accessed_at    = excluded.accessed_at
+                """,
+                (md5_hash, text, parser_used, now, now),
+            )
 
     # ── Helpers ─────────────────────────────────────────────────────────
 
