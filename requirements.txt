@@ -12,8 +12,9 @@ chromadb>=0.5
 
 # ── Document Parsers ──────────────────────────────────────────────────────────
 pymupdf>=1.24                         # PyMuPDF — fast PDF extraction
-docling>=2.0                          # layout-aware parsing
-pytesseract>=0.3                      # Tesseract OCR wrapper (system tesseract required)
+docling>=2.0                          # layout-aware parsing (scanned PDFs via RapidOCR)
+rapidocr-onnxruntime>=1.3             # ONNX-based OCR; 3-10x faster than Tesseract on CPU
+pytesseract>=0.3                      # kept as fallback; replaced by rapidocr in hot path
 
 # ── State DB / incremental logic ─────────────────────────────────────────────
 # SQLite ships with Python stdlib — no package needed.

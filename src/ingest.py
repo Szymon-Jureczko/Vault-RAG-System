@@ -14,8 +14,8 @@ from pathlib import Path
 from src.batch import BatchCommitter
 from src.config import Settings
 from src.embeddings import EmbeddingService
-from src.models import FileStatus, IngestionStats, ParseResult
-from src.parsers import parse_file
+from src.models import FileStatus, IngestionStats, ParseResult, TrackedFile
+from src.parsers import IMAGE_EXTENSIONS, _split_text, parse_file
 from src.state_db import StateDB, compute_md5
 from src.vector_store import VectorStore
 
@@ -24,9 +24,23 @@ logger = logging.getLogger(__name__)
 # File extensions accepted by the pipeline (union of all parser extensions).
 SUPPORTED_EXTENSIONS = {
     ".pdf",
-    ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp",
-    ".txt", ".md", ".rst", ".csv", ".json", ".xml", ".html",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".tiff",
+    ".tif",
+    ".bmp",
+    ".txt",
+    ".md",
+    ".rst",
+    ".csv",
+    ".json",
+    ".xml",
+    ".html",
 }
+
+# Parser names that produce OCR output and whose results should be cached.
+_OCR_PARSER_NAMES: frozenset[str] = frozenset({"rapidocr", "docling"})
 
 
 def discover_files(directory: Path) -> list[Path]:
@@ -85,10 +99,13 @@ class IngestionPipeline:
 
         Steps:
             1. Discover files with supported extensions.
-            2. Filter out unchanged files (MD5 check via state DB).
-            3. Parse changed/new files using concurrent workers.
-            4. Commit chunks to the vector store through BatchCommitter.
-            5. Update state DB with results.
+            2. Compute MD5 for each file; filter out unchanged files (single
+               pass — eliminates the previous double-compute).
+            3. Check OCR result cache for image files; skip executor for hits.
+            4. Parse remaining files using concurrent workers.
+            5. Store OCR results in cache for future retries.
+            6. Commit chunks to the vector store through BatchCommitter.
+            7. Update state DB with results.
 
         Args:
             source_dir: Directory containing documents to ingest.
@@ -101,15 +118,25 @@ class IngestionPipeline:
 
         all_files = discover_files(source_dir)
         stats.total_files = len(all_files)
-        logger.info("Discovered %d supported files in %s", len(all_files), source_dir)
+        logger.info(
+            "Discovered %d supported files in %s", len(all_files), source_dir
+        )
 
-        # ── Filter unchanged ────────────────────────────────────────────
+        # ── Single-pass MD5 filter ───────────────────────────────────────
+        # Compute MD5 once per file and reuse it for both the unchanged check
+        # and the PROCESSING upsert.  Previously compute_md5() was called
+        # twice: once inside is_unchanged() and again when marking PROCESSING.
         files_to_process: list[Path] = []
+        md5_map: dict[str, str] = {}  # str(fp) -> md5 (files_to_process only)
+
         for fp in all_files:
-            if self._state_db.is_unchanged(fp):
+            existing = self._state_db.get_file(fp)
+            md5 = compute_md5(fp)
+            if existing is not None and existing.md5_hash == md5:
                 stats.skipped_unchanged += 1
             else:
                 files_to_process.append(fp)
+                md5_map[str(fp)] = md5
 
         logger.info(
             "%d files to process (%d skipped as unchanged)",
@@ -122,34 +149,75 @@ class IngestionPipeline:
 
         # ── Mark files as PROCESSING ────────────────────────────────────
         for fp in files_to_process:
-            from src.models import TrackedFile
-
-            md5 = compute_md5(fp)
             self._state_db.upsert(
-                TrackedFile(path=fp, md5_hash=md5, status=FileStatus.PROCESSING)
+                TrackedFile(
+                    path=fp,
+                    md5_hash=md5_map[str(fp)],
+                    status=FileStatus.PROCESSING,
+                )
             )
 
-        # ── Parse concurrently ──────────────────────────────────────────
-        max_workers = min(self._settings.max_workers, len(files_to_process))
+        # ── OCR cache lookup (image files only) ─────────────────────────
+        # If a previously OCR'd image is being retried (e.g. after
+        # reset_failed()), retrieve the cached text instead of re-running OCR.
         results: dict[str, ParseResult] = {}
+        files_needing_parse: list[Path] = []
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(_parse_file_worker, str(fp), chunk_size): fp
-                for fp in files_to_process
-            }
-            for future in as_completed(futures):
-                fp = futures[future]
-                try:
-                    result = future.result()
-                    results[str(fp)] = result
-                except Exception as exc:
-                    logger.error("Worker exception for %s: %s", fp, exc)
+        for fp in files_to_process:
+            if fp.suffix.lower() in IMAGE_EXTENSIONS:
+                cached_text = self._state_db.get_ocr_cache(md5_map[str(fp)])
+                if cached_text is not None:
+                    logger.info("OCR cache hit for %s", fp)
+                    chunks = _split_text(cached_text, fp, chunk_size, "cache")
                     results[str(fp)] = ParseResult(
                         source_path=fp,
-                        success=False,
-                        error_message=str(exc),
+                        chunks=chunks,
+                        parser_used="cache",
+                        page_count=1,
+                        success=True,
                     )
+                    continue
+            files_needing_parse.append(fp)
+
+        # ── Parse concurrently ──────────────────────────────────────────
+        max_workers = min(self._settings.max_workers, len(files_needing_parse))
+
+        if files_needing_parse:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _parse_file_worker, str(fp), chunk_size
+                    ): fp
+                    for fp in files_needing_parse
+                }
+                for future in as_completed(futures):
+                    fp = futures[future]
+                    try:
+                        result = future.result()
+                        results[str(fp)] = result
+                    except Exception as exc:
+                        logger.error("Worker exception for %s: %s", fp, exc)
+                        results[str(fp)] = ParseResult(
+                            source_path=fp,
+                            success=False,
+                            error_message=str(exc),
+                        )
+
+        # ── Store OCR results in cache ───────────────────────────────────
+        # Cache text for image files that were successfully OCR'd so that
+        # future retries (after reset_failed()) skip the OCR engine entirely.
+        for fp in files_needing_parse:
+            result = results.get(str(fp))
+            if (
+                result
+                and result.success
+                and result.parser_used in _OCR_PARSER_NAMES
+                and fp.suffix.lower() in IMAGE_EXTENSIONS
+            ):
+                combined_text = "\n".join(c.content for c in result.chunks)
+                self._state_db.put_ocr_cache(
+                    md5_map[str(fp)], combined_text, result.parser_used
+                )
 
         # ── Commit results ──────────────────────────────────────────────
         for fp in files_to_process:

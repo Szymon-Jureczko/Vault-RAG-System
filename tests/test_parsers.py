@@ -38,10 +38,14 @@ class TestGetParser:
     """Tests for the parser dispatcher."""
 
     def test_pdf_extension(self) -> None:
-        """PDF files should resolve to PyMuPDFParser."""
+        """PDF files return None from get_parser(); routing is done by parse_file().
+
+        PDFs require content-aware routing (text-layer probe) that lives in
+        parse_file(), not in get_parser(), so the registry intentionally
+        excludes PDF extensions.
+        """
         parser = get_parser(Path("doc.pdf"))
-        assert parser is not None
-        assert parser.name == "pymupdf"
+        assert parser is None
 
     def test_txt_extension(self) -> None:
         """Text files should resolve to TextParser."""
@@ -50,10 +54,10 @@ class TestGetParser:
         assert parser.name == "text"
 
     def test_image_extension(self) -> None:
-        """Image files should resolve to TesseractParser."""
+        """Image files should resolve to RapidOCRParser."""
         parser = get_parser(Path("scan.png"))
         assert parser is not None
-        assert parser.name == "tesseract"
+        assert parser.name == "rapidocr"
 
     def test_unsupported_extension(self) -> None:
         """Unsupported extensions return None."""

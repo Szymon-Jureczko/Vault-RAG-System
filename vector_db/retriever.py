@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import pickle
 from pathlib import Path
 
 import chromadb
@@ -99,6 +100,7 @@ class HybridRetriever:
         self._corpus_ids: list[str] = []
         self._corpus_texts: list[str] = []
         self._corpus_metas: list[dict] = []
+        self._bm25_index_path = Path(str(chroma_path)) / "bm25_index.pkl"
 
     def _build_bm25_index(self) -> None:
         """Build/rebuild the BM25 index from all documents in ChromaDB."""
@@ -113,6 +115,65 @@ class HybridRetriever:
             "BM25 index built with %d documents",
             len(self._corpus_ids),
         )
+        self._save_bm25_index()
+
+    def _save_bm25_index(self) -> None:
+        """Persist BM25 index and corpus to disk atomically."""
+        payload = {
+            "ids": self._corpus_ids,
+            "texts": self._corpus_texts,
+            "metas": self._corpus_metas,
+            "bm25": self._bm25,
+        }
+        tmp = self._bm25_index_path.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(self._bm25_index_path)
+        logger.info("BM25 index persisted to %s", self._bm25_index_path)
+
+    def _load_bm25_index(self) -> bool:
+        """Load BM25 index from disk if it exists and matches ChromaDB.
+
+        Returns:
+            True if loaded successfully, False if a rebuild is needed.
+        """
+        if not self._bm25_index_path.exists():
+            return False
+        try:
+            with self._bm25_index_path.open("rb") as f:
+                payload = pickle.load(f)
+            chroma_count = self._collection.count()
+            if len(payload["ids"]) != chroma_count:
+                logger.info(
+                    "BM25 index stale (%d docs on disk, %d in ChromaDB)"
+                    " — rebuilding",
+                    len(payload["ids"]),
+                    chroma_count,
+                )
+                return False
+            self._corpus_ids = payload["ids"]
+            self._corpus_texts = payload["texts"]
+            self._corpus_metas = payload["metas"]
+            self._bm25 = payload["bm25"]
+            logger.info(
+                "BM25 index loaded from disk (%d docs)", chroma_count
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Could not load BM25 index: %s — rebuilding", exc
+            )
+            return False
+
+    def _load_or_build_bm25_index(self) -> None:
+        """Load BM25 index from disk, or build it fresh from ChromaDB."""
+        if not self._load_bm25_index():
+            if self._collection.count() > 0:
+                self._build_bm25_index()
+            else:
+                logger.info(
+                    "ChromaDB collection is empty — BM25 index deferred"
+                )
 
     def _semantic_search(
         self, query: str, n_results: int

@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     batch_size: int = 50
     batch_gc_interval: int = 500
 
+    # ── OCR tuning ──────────────────────────────────────────────────────
+    pdf_ocr_threshold: int = 50  # avg chars/page below this → Docling OCR
+
     @property
     def is_dev(self) -> bool:
         """Return True when running in development mode."""
@@ -63,7 +66,7 @@ class Settings(BaseSettings):
 
     @property
     def active_model(self) -> str:
-        """Return the LLM model name appropriate for the current environment."""
+        """Return the active LLM model name for the current environment."""
         return self.ollama_model_dev if self.is_dev else self.ollama_model_eval
 
 
