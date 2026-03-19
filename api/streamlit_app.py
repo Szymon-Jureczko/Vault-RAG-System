@@ -7,6 +7,8 @@ Run with::
 
 from __future__ import annotations
 
+import time
+
 import requests
 import streamlit as st
 
@@ -27,37 +29,47 @@ with st.sidebar:
     if st.button("Sync Documents", type="primary"):
         with st.spinner("Running incremental ingestion..."):
             try:
+                # Kick off background job
                 resp = requests.post(
                     f"{API_BASE}/sync",
                     json={"source_dir": source_dir},
-                    timeout=600,
+                    timeout=30,
                 )
                 resp.raise_for_status()
-                data = resp.json()
-                stats = data["stats"]
+                job = resp.json()
+                job_id = job["job_id"]
 
-                st.success(f"Sync complete: {data['status']}")
+                # Poll until complete
+                while True:
+                    time.sleep(3)
+                    poll = requests.get(f"{API_BASE}/sync/{job_id}", timeout=10)
+                    poll.raise_for_status()
+                    data = poll.json()
+                    if not data["status"].startswith("running"):
+                        break
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Processed", stats["processed"])
-                col2.metric("Skipped", stats["skipped_unchanged"])
-                col3.metric("Failed", stats["failed"])
+                if data["status"] != "completed":
+                    st.error(f"Sync failed: {data['status']}")
+                else:
+                    stats = data["stats"]
+                    st.success("Sync complete")
 
-                st.metric("Total Chunks", stats["total_chunks"])
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Processed", stats["processed"])
+                    col2.metric("Skipped", stats["skipped_unchanged"])
+                    col3.metric("Failed", stats["failed"])
 
-                # Progress bar
-                total = stats["total_discovered"]
-                if total > 0:
-                    done = stats["processed"] + stats["skipped_unchanged"]
-                    st.progress(
-                        min(done / total, 1.0),
-                        text=f"{done}/{total} files complete",
-                    )
+                    st.metric("Total Chunks", stats["total_chunks"])
+
+                    total = stats["total_discovered"]
+                    if total > 0:
+                        done = stats["processed"] + stats["skipped_unchanged"]
+                        st.progress(
+                            min(done / total, 1.0),
+                            text=f"{done}/{total} files complete",
+                        )
             except requests.ConnectionError:
-                st.error(
-                    "Cannot connect to API server. "
-                    "Is it running on port 8000?"
-                )
+                st.error("Cannot connect to API server. " "Is it running on port 8000?")
             except Exception as e:
                 st.error(f"Sync failed: {e}")
 
@@ -69,10 +81,7 @@ with st.sidebar:
             resp = requests.get(f"{API_BASE}/health", timeout=10)
             health = resp.json()
             if health.get("status") == "healthy":
-                st.success(
-                    f"Healthy — {health['documents']}"
-                    " documents indexed"
-                )
+                st.success(f"Healthy — {health['documents']}" " documents indexed")
             else:
                 st.warning(f"Degraded: {health.get('error', 'unknown')}")
         except requests.ConnectionError:
@@ -126,10 +135,7 @@ if question := st.chat_input("Ask a question about your documents..."):
                     with st.expander("Citations & Sources"):
                         for r in data["results"]:
                             c = r["citation"]
-                            page_str = (
-                                f", Page {c['page']}"
-                                if c.get("page") else ""
-                            )
+                            page_str = f", Page {c['page']}" if c.get("page") else ""
                             st.markdown(
                                 f"**{c['filename']}**"
                                 f"{page_str} "
@@ -139,11 +145,13 @@ if question := st.chat_input("Ask a question about your documents..."):
                             st.divider()
                             citations.append(c)
 
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": answer,
-                    "citations": citations,
-                })
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "citations": citations,
+                    }
+                )
 
             except requests.ConnectionError:
                 err = (
@@ -151,14 +159,18 @@ if question := st.chat_input("Ask a question about your documents..."):
                     "Start it with: `uvicorn api.main:app`"
                 )
                 st.error(err)
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": err,
-                })
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": err,
+                    }
+                )
             except Exception as e:
                 err = f"Query failed: {e}"
                 st.error(err)
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": err,
-                })
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": err,
+                    }
+                )
