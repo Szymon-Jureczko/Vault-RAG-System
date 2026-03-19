@@ -36,7 +36,9 @@ _pipeline: IngestionPipeline | None = None
 def _get_retriever() -> HybridRetriever:
     """Return the HybridRetriever singleton (initialised at startup)."""
     if _retriever is None:
-        raise RuntimeError("Retriever not initialised — startup may have failed")
+        raise RuntimeError(
+            "Retriever not initialised — startup may have failed"
+        )
     return _retriever
 
 
@@ -50,7 +52,7 @@ def _get_pipeline() -> IngestionPipeline:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Eagerly initialise HybridRetriever at startup so BM25 is ready immediately."""
+    """Initialise HybridRetriever at startup so BM25 is ready immediately."""
     global _retriever
     logger.info("Initialising HybridRetriever at startup…")
     _retriever = HybridRetriever()
@@ -334,7 +336,8 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
         "the context. Do NOT put words in quotation marks unless you are "
         "copying them verbatim from the context. "
         "Cite the source filename for each claim you make. "
-        "If the context does not contain enough information to answer, say so.\n\n"
+        "If the context does not contain enough information "
+        "to answer, say so.\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n\nAnswer:"
     )

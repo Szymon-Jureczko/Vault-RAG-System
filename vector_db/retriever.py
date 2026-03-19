@@ -146,7 +146,8 @@ class HybridRetriever:
             chroma_count = self._collection.count()
             if len(payload["ids"]) != chroma_count:
                 logger.info(
-                    "BM25 index stale (%d docs on disk, %d in ChromaDB) — rebuilding",
+                    "BM25 index stale (%d docs on disk, %d in ChromaDB)"
+                    " — rebuilding",
                     len(payload["ids"]),
                     chroma_count,
                 )
@@ -167,7 +168,9 @@ class HybridRetriever:
             if self._collection.count() > 0:
                 self._build_bm25_index()
             else:
-                logger.info("ChromaDB collection is empty — BM25 index deferred")
+                logger.info(
+                    "ChromaDB collection is empty — BM25 index deferred"
+                )
 
     def _semantic_search(
         self, query: str, n_results: int
@@ -181,7 +184,9 @@ class HybridRetriever:
         Returns:
             List of (id, text, metadata, distance) tuples.
         """
-        embedding = self._embedder.encode([query], show_progress_bar=False).tolist()
+        embedding = self._embedder.encode(
+            [query], show_progress_bar=False
+        ).tolist()
         results = self._collection.query(
             query_embeddings=embedding,
             n_results=min(n_results, self._collection.count()),
@@ -218,9 +223,9 @@ class HybridRetriever:
         tokens = query.lower().split()
         scores = self._bm25.get_scores(tokens)
 
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
-            :n_results
-        ]
+        top_indices = sorted(
+            range(len(scores)), key=lambda i: scores[i], reverse=True
+        )[:n_results]
 
         items = []
         for idx in top_indices:
@@ -365,7 +370,8 @@ class HybridRetriever:
             )
 
         logger.info(
-            "Query returned %d results " "(from %d semantic + %d BM25 candidates)",
+            "Query returned %d results "
+            "(from %d semantic + %d BM25 candidates)",
             len(results),
             len(semantic_results),
             len(bm25_results),
@@ -373,5 +379,5 @@ class HybridRetriever:
         return results
 
     def refresh_index(self) -> None:
-        """Rebuild the BM25 index from the current ChromaDB state and persist it."""
+        """Rebuild the BM25 index from ChromaDB and persist to disk."""
         self._build_bm25_index()
