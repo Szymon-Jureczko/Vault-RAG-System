@@ -26,7 +26,7 @@ from pathlib import Path
 import chromadb
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import CrossEncoder
 
 from ingestion.config import settings
 
@@ -85,8 +85,7 @@ class HybridRetriever:
         collection_name: str = "localvault_docs",
     ) -> None:
         chroma_path = chroma_path or settings.chroma_persist_path
-        self._bm25_index_path = Path(chroma_path) / "bm25_index.pkl"
-        self._embedder = SentenceTransformer(
+        self._embedder = self._init_embedder(
             embedding_model or settings.embedding_model
         )
         self._reranker = CrossEncoder(reranker_model or self._RERANKER_MODEL)
@@ -101,7 +100,66 @@ class HybridRetriever:
         self._corpus_ids: list[str] = []
         self._corpus_texts: list[str] = []
         self._corpus_metas: list[dict] = []
-        self._load_or_build_bm25_index()
+        self._bm25_index_path = Path(str(chroma_path)) / "bm25_index.pkl"
+
+    @staticmethod
+    def _init_embedder(model_name: str):
+        """Initialise embedding backend (ONNX-first, PyTorch fallback).
+
+        Mirrors the ingestion pipeline strategy so query and document
+        embeddings are numerically identical.
+        """
+        hub_id = f"sentence-transformers/{model_name}"
+        onnx_cache = settings.chroma_persist_path.parent / "onnx" / model_name
+        try:
+            import numpy as np
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from transformers import AutoTokenizer
+
+            if onnx_cache.exists():
+                tokenizer = AutoTokenizer.from_pretrained(str(onnx_cache))
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                    str(onnx_cache)
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(hub_id)
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                    hub_id, export=True
+                )
+                onnx_cache.mkdir(parents=True, exist_ok=True)
+                tokenizer.save_pretrained(str(onnx_cache))
+                ort_model.save_pretrained(str(onnx_cache))
+            logger.info("Retriever using ONNX runtime for embeddings")
+
+            class _OnnxEmbedder:
+                """Thin wrapper matching SentenceTransformer.encode()."""
+
+                def __init__(self, tok, mdl):
+                    self._tok = tok
+                    self._mdl = mdl
+
+                def encode(self, texts, **_kw):
+                    enc = self._tok(
+                        texts,
+                        padding=True,
+                        truncation=True,
+                        max_length=512,
+                        return_tensors="np",
+                    )
+                    out = self._mdl(**enc)
+                    mask = enc["attention_mask"]
+                    emb = (out.last_hidden_state * mask[..., np.newaxis]).sum(
+                        axis=1
+                    ) / mask.sum(axis=-1, keepdims=True)
+                    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+                    return emb / norms
+
+            return _OnnxEmbedder(tokenizer, ort_model)
+        except Exception as exc:
+            from sentence_transformers import SentenceTransformer
+
+            logger.info("ONNX unavailable (%s), using PyTorch", exc)
+            return SentenceTransformer(model_name)
 
     def _build_bm25_index(self) -> None:
         """Build/rebuild the BM25 index from all documents in ChromaDB."""
@@ -168,9 +226,7 @@ class HybridRetriever:
             if self._collection.count() > 0:
                 self._build_bm25_index()
             else:
-                logger.info(
-                    "ChromaDB collection is empty — BM25 index deferred"
-                )
+                logger.info("ChromaDB collection is empty — BM25 index deferred")
 
     def _semantic_search(
         self, query: str, n_results: int
@@ -184,9 +240,9 @@ class HybridRetriever:
         Returns:
             List of (id, text, metadata, distance) tuples.
         """
-        embedding = self._embedder.encode(
-            [query], show_progress_bar=False
-        ).tolist()
+        embedding = self._embedder.encode([query], show_progress_bar=False)
+        if hasattr(embedding, "tolist"):
+            embedding = embedding.tolist()
         results = self._collection.query(
             query_embeddings=embedding,
             n_results=min(n_results, self._collection.count()),
@@ -223,9 +279,9 @@ class HybridRetriever:
         tokens = query.lower().split()
         scores = self._bm25.get_scores(tokens)
 
-        top_indices = sorted(
-            range(len(scores)), key=lambda i: scores[i], reverse=True
-        )[:n_results]
+        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
+            :n_results
+        ]
 
         items = []
         for idx in top_indices:
@@ -326,8 +382,8 @@ class HybridRetriever:
         self,
         query_text: str,
         top_k: int = 5,
-        semantic_candidates: int = 20,
-        bm25_candidates: int = 20,
+        semantic_candidates: int = 50,
+        bm25_candidates: int = 50,
     ) -> list[RetrievalResult]:
         """Execute a hybrid search with reranking and citations.
 
@@ -370,8 +426,7 @@ class HybridRetriever:
             )
 
         logger.info(
-            "Query returned %d results "
-            "(from %d semantic + %d BM25 candidates)",
+            "Query returned %d results " "(from %d semantic + %d BM25 candidates)",
             len(results),
             len(semantic_results),
             len(bm25_results),
@@ -379,5 +434,5 @@ class HybridRetriever:
         return results
 
     def refresh_index(self) -> None:
-        """Rebuild the BM25 index from ChromaDB and persist to disk."""
+        """Rebuild the BM25 index from the current ChromaDB state."""
         self._build_bm25_index()
