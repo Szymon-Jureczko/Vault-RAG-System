@@ -10,6 +10,8 @@
 ---
 
 ## Overview
+<img width="1782" height="937" alt="projimg3" src="https://github.com/user-attachments/assets/fa1036cc-d5ed-410e-b90d-44030c68ecf2" />
+<img width="1292" height="732" alt="projimg4" src="https://github.com/user-attachments/assets/a84cef4a-6cda-418c-8fc8-0da2677880d7" />
 
 LocalVaultRAG ingests thousands of messy enterprise documents — PDFs, Word files, spreadsheets, emails, and scanned images — indexes them with a hybrid search engine, and answers natural-language questions with cited sources. Everything runs on your machine. No OpenAI keys, no cloud APIs, no data ever leaves your network.
 
