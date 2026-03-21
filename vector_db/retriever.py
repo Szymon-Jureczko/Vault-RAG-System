@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import re
 from pathlib import Path
 
 import chromadb
@@ -76,6 +77,10 @@ class HybridRetriever:
     """
 
     _RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    _FILENAME_RE = re.compile(
+        r"\b([\w][\w\-]*\.(?:png|jpg|jpeg|pdf|eml|docx|txt|csv))\b",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -168,7 +173,7 @@ class HybridRetriever:
         self._corpus_texts = all_docs["documents"]
         self._corpus_metas = all_docs["metadatas"]
 
-        tokenized = [doc.lower().split() for doc in self._corpus_texts]
+        tokenized = [re.findall(r"\w+", doc.lower()) for doc in self._corpus_texts]
         self._bm25 = BM25Okapi(tokenized)
         logger.info(
             "BM25 index built with %d documents",
@@ -276,7 +281,7 @@ class HybridRetriever:
         if self._bm25 is None:
             self._build_bm25_index()
 
-        tokens = query.lower().split()
+        tokens = re.findall(r"\w+", query.lower())
         scores = self._bm25.get_scores(tokens)
 
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
@@ -378,6 +383,35 @@ class HybridRetriever:
             source_path=metadata.get("source", ""),
         )
 
+    def _filename_search(self, query: str) -> list[tuple[str, str, dict, float]]:
+        """Fetch all chunks for any filename explicitly mentioned in the query.
+
+        Uses ChromaDB metadata filtering, bypassing BM25 and semantic search,
+        so the exact file is always retrievable regardless of embedding similarity.
+
+        Args:
+            query: Natural language query string.
+
+        Returns:
+            List of (id, text, metadata, score) tuples with a high fixed score.
+        """
+        results = []
+        for match in self._FILENAME_RE.finditer(query):
+            fname = match.group(1)
+            try:
+                resp = self._collection.get(
+                    where={"filename": fname},
+                    include=["documents", "metadatas"],
+                )
+            except Exception as exc:
+                logger.debug("Filename metadata lookup failed for %s: %s", fname, exc)
+                continue
+            for doc_id, text, meta in zip(
+                resp["ids"], resp["documents"], resp["metadatas"]
+            ):
+                results.append((doc_id, text, meta, 2.0))
+        return results
+
     def query(
         self,
         query_text: str,
@@ -410,8 +444,17 @@ class HybridRetriever:
         # Step 3: Reciprocal Rank Fusion
         fused = self._reciprocal_rank_fusion(semantic_results, bm25_results)
 
+        # Step 3b: Prepend any chunks for filenames explicitly named in the query
+        filename_hits = self._filename_search(query_text)
+        if filename_hits:
+            seen_ids = {hit[0] for hit in filename_hits}
+            fused = [c for c in fused if c[0] not in seen_ids]
+            candidates = filename_hits + fused
+        else:
+            candidates = fused
+
         # Step 4: Cross-encoder reranking
-        reranked = self._rerank(query_text, fused, top_k)
+        reranked = self._rerank(query_text, candidates, top_k)
 
         # Step 5: Build results with citations
         results = []
