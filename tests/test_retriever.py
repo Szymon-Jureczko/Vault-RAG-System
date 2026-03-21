@@ -1,9 +1,16 @@
 """Tests for vector_db.retriever.HybridRetriever.
 
-Three test classes:
-- TestBM25Tokenizer   — pure unit tests for the regex tokenizer fix (no DB)
-- TestFilenameRegex   — pure unit tests for the _FILENAME_RE class pattern
-- TestHybridRetrieverIntegration — integration tests against the real data/chroma DB
+Unit test classes (no DB, fast):
+- TestCitation          — Citation pydantic model
+- TestRetrievalResult   — RetrievalResult pydantic model
+- TestReciprocalRankFusion — static RRF merge algorithm
+- TestBuildCitation     — _build_citation static helper
+- TestBM25Tokenizer     — regex tokenizer fix (no BM25 score regressions)
+- TestFilenameRegex     — _FILENAME_RE class pattern
+- TestProperNounRegex   — _PROPER_NOUN_RE class pattern
+
+Integration tests (real data/chroma DB):
+- TestHybridRetrieverIntegration
 """
 
 from __future__ import annotations
@@ -14,7 +21,99 @@ from pathlib import Path
 import pytest
 from rank_bm25 import BM25Okapi
 
-from vector_db.retriever import HybridRetriever
+from vector_db.retriever import Citation, HybridRetriever, RetrievalResult
+
+
+# ---------------------------------------------------------------------------
+# Unit: pydantic models
+# ---------------------------------------------------------------------------
+
+
+class TestCitation:
+    """Tests for the Citation model."""
+
+    def test_citation_defaults(self) -> None:
+        c = Citation(filename="test.pdf")
+        assert c.filename == "test.pdf"
+        assert c.page is None
+        assert c.snippet == ""
+
+    def test_citation_with_page(self) -> None:
+        c = Citation(filename="report.pdf", page=5, snippet="The key finding...")
+        assert c.page == 5
+        assert "key finding" in c.snippet
+
+
+class TestRetrievalResult:
+    """Tests for the RetrievalResult model."""
+
+    def test_result_defaults(self) -> None:
+        r = RetrievalResult(chunk_id="abc", text="some text")
+        assert r.score == 0.0
+        assert r.citation.filename == ""
+
+    def test_result_with_citation(self) -> None:
+        r = RetrievalResult(
+            chunk_id="abc",
+            text="some text",
+            score=0.95,
+            citation=Citation(filename="doc.pdf", page=3),
+        )
+        assert r.score == 0.95
+        assert r.citation.filename == "doc.pdf"
+
+
+# ---------------------------------------------------------------------------
+# Unit: static helpers
+# ---------------------------------------------------------------------------
+
+
+class TestReciprocalRankFusion:
+    """Tests for the RRF merging algorithm."""
+
+    def test_single_list(self) -> None:
+        results = [
+            ("id1", "text1", {"src": "a"}, 0.9),
+            ("id2", "text2", {"src": "b"}, 0.8),
+        ]
+        fused = HybridRetriever._reciprocal_rank_fusion(results)
+        assert len(fused) == 2
+        assert fused[0][0] == "id1"
+
+    def test_two_lists_merges(self) -> None:
+        list1 = [
+            ("id1", "text1", {"src": "a"}, 0.9),
+            ("id2", "text2", {"src": "b"}, 0.7),
+        ]
+        list2 = [
+            ("id2", "text2", {"src": "b"}, 5.0),
+            ("id3", "text3", {"src": "c"}, 3.0),
+        ]
+        fused = HybridRetriever._reciprocal_rank_fusion(list1, list2)
+        ids = [f[0] for f in fused]
+        assert ids.index("id2") < ids.index("id3")
+
+    def test_empty_lists(self) -> None:
+        fused = HybridRetriever._reciprocal_rank_fusion([], [])
+        assert fused == []
+
+
+class TestBuildCitation:
+    """Tests for citation building from metadata."""
+
+    def test_builds_from_metadata(self) -> None:
+        meta = {"filename": "report.pdf", "page": 2, "source": "/data/report.pdf"}
+        c = HybridRetriever._build_citation(meta, "First chunk of text.")
+        assert c.filename == "report.pdf"
+        assert c.page == 2
+        assert c.source_path == "/data/report.pdf"
+        assert len(c.snippet) <= 200
+
+    def test_missing_metadata_fields(self) -> None:
+        c = HybridRetriever._build_citation({}, "hello")
+        assert c.filename == "unknown"
+        assert c.page is None
+
 
 # ---------------------------------------------------------------------------
 # Unit: BM25 tokenizer
@@ -68,7 +167,6 @@ class TestBM25Tokenizer:
         corpus_text = "[Source: img_0031.png]\nsome text"
         old_corpus_tokens = corpus_text.lower().split()
         old_query_tokens = "what can you tell me about img_0031.png?".lower().split()
-        # The corpus has 'img_0031.png]', the query has 'img_0031.png?' — no overlap
         corpus_filename_tokens = {t for t in old_corpus_tokens if "img_0031" in t}
         query_filename_tokens = {t for t in old_query_tokens if "img_0031" in t}
         assert corpus_filename_tokens.isdisjoint(query_filename_tokens)

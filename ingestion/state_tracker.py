@@ -224,7 +224,7 @@ class StateTracker:
     def mark_completed(
         self,
         file_path: str | Path,
-        vector_id: str,
+        vector_id: str | None = None,
     ) -> None:
         """Record that *file_path* was successfully embedded.
 
@@ -277,10 +277,36 @@ class StateTracker:
         """
         now = _now_iso()
         self.conn.execute(
-            "UPDATE file_state SET parsing_status = ?, updated_at = ? WHERE file_path = ?",
+            "UPDATE file_state SET parsing_status = ?, "
+            "updated_at = ? WHERE file_path = ?",
             (status.value, now, str(file_path)),
         )
         self.conn.commit()
+
+    # ── purge ──────────────────────────────────────────────────────────────
+
+    def purge_deleted(self, known_paths: set[str]) -> list[str]:
+        """Remove state records for files no longer present on disk.
+
+        Args:
+            known_paths: Set of string paths currently on disk.
+
+        Returns:
+            List of file paths that were removed from the state DB.
+        """
+        rows = self.conn.execute("SELECT file_path FROM file_state").fetchall()
+        stale = [
+            row["file_path"] for row in rows if row["file_path"] not in known_paths
+        ]
+        if not stale:
+            return []
+        self.conn.executemany(
+            "DELETE FROM file_state WHERE file_path = ?",
+            [(p,) for p in stale],
+        )
+        self.conn.commit()
+        logger.info("Purged %d stale records from state DB", len(stale))
+        return stale
 
     # ── stats ───────────────────────────────────────────────────────────────
 
@@ -291,6 +317,7 @@ class StateTracker:
             Dict like ``{"pending": 3, "completed": 42, ...}``.
         """
         rows = self.conn.execute(
-            "SELECT parsing_status, COUNT(*) AS cnt FROM file_state GROUP BY parsing_status"
+            "SELECT parsing_status, COUNT(*) AS cnt "
+            "FROM file_state GROUP BY parsing_status"
         ).fetchall()
         return {row["parsing_status"]: row["cnt"] for row in rows}
