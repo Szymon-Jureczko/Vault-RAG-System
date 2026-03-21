@@ -117,6 +117,43 @@ class TestFilenameRegex:
 
 
 # ---------------------------------------------------------------------------
+# Unit: proper-noun / phrase regex
+# ---------------------------------------------------------------------------
+
+
+class TestProperNounRegex:
+    """Verify HybridRetriever._PROPER_NOUN_RE captures multi-word title-case phrases."""
+
+    def test_matches_full_name(self):
+        """Two-word person names are captured."""
+        m = HybridRetriever._PROPER_NOUN_RE.search("authored by Angela Graham")
+        assert m is not None
+        assert m.group(1) == "Angela Graham"
+
+    def test_matches_hyphenated_company(self):
+        """Hyphenated company names are captured."""
+        m = HybridRetriever._PROPER_NOUN_RE.search("documents about Ward-Hardy")
+        assert m is not None
+        assert m.group(1) == "Ward-Hardy"
+
+    def test_matches_three_word_name(self):
+        """Three-word names are captured as a single phrase."""
+        m = HybridRetriever._PROPER_NOUN_RE.search("by Angela Marie Graham")
+        assert m is not None
+        assert m.group(1) == "Angela Marie Graham"
+
+    def test_no_match_single_word(self):
+        """A single capitalised word does not match (too ambiguous)."""
+        assert not HybridRetriever._PROPER_NOUN_RE.search("what is the Budget?")
+
+    def test_no_match_lowercase_sentence(self):
+        """Lowercase text is not matched."""
+        assert not HybridRetriever._PROPER_NOUN_RE.search(
+            "what do all documents concern?"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Integration: real data/chroma DB
 # ---------------------------------------------------------------------------
 
@@ -160,3 +197,21 @@ class TestHybridRetrieverIntegration:
         assert isinstance(results, list)
         filenames = [r.citation.filename for r in results]
         assert "ghost_file_9999.png" not in filenames
+
+    def test_phrase_search_direct(self, retriever):
+        """_phrase_search must return at least one chunk whose text contains
+        'Angela Graham' verbatim (stored in img_0037.png)."""
+        hits = retriever._phrase_search(
+            "What do documents authored by Angela Graham concern?"
+        )
+        assert len(hits) > 0
+        filenames = {meta.get("filename") for _, _, meta, _ in hits}
+        assert "img_0037.png" in filenames
+
+    def test_author_query_returns_correct_file(self, retriever):
+        """End-to-end: querying by author name must surface the correct document."""
+        results = retriever.query(
+            "What do documents authored by Angela Graham concern?", top_k=5
+        )
+        filenames = [r.citation.filename for r in results]
+        assert "img_0037.png" in filenames

@@ -81,6 +81,7 @@ class HybridRetriever:
         r"\b([\w][\w\-]*\.(?:png|jpg|jpeg|pdf|eml|docx|txt|csv))\b",
         re.IGNORECASE,
     )
+    _PROPER_NOUN_RE = re.compile(r"\b([A-Z][a-z]+(?:[ \-][A-Z][a-z]+)+)\b")
 
     def __init__(
         self,
@@ -412,6 +413,41 @@ class HybridRetriever:
                 results.append((doc_id, text, meta, 2.0))
         return results
 
+    def _phrase_search(
+        self, query: str
+    ) -> list[tuple[str, str, dict, float]]:
+        """Fetch chunks containing proper-noun phrases found in the query.
+
+        Detects sequences of 2+ consecutive title-case words (e.g. person names,
+        company names) and does a ChromaDB verbatim substring search for each,
+        guaranteeing that chunks containing the exact phrase reach the reranker.
+
+        Args:
+            query: Natural language query string.
+
+        Returns:
+            List of (id, text, metadata, score) tuples with a fixed score of 1.5.
+        """
+        results = []
+        seen: set[str] = set()
+        for match in self._PROPER_NOUN_RE.finditer(query):
+            phrase = match.group(1)
+            try:
+                resp = self._collection.get(
+                    where_document={"$contains": phrase},
+                    include=["documents", "metadatas"],
+                )
+            except Exception as exc:
+                logger.debug("Phrase lookup failed for %r: %s", phrase, exc)
+                continue
+            for doc_id, text, meta in zip(
+                resp["ids"], resp["documents"], resp["metadatas"]
+            ):
+                if doc_id not in seen:
+                    seen.add(doc_id)
+                    results.append((doc_id, text, meta, 1.5))
+        return results
+
     def query(
         self,
         query_text: str,
@@ -452,6 +488,12 @@ class HybridRetriever:
             candidates = filename_hits + fused
         else:
             candidates = fused
+
+        # Step 3c: Append chunks containing proper-noun phrases from the query
+        phrase_hits = self._phrase_search(query_text)
+        if phrase_hits:
+            seen_ids = {c[0] for c in candidates}
+            candidates += [c for c in phrase_hits if c[0] not in seen_ids]
 
         # Step 4: Cross-encoder reranking
         reranked = self._rerank(query_text, candidates, top_k)
