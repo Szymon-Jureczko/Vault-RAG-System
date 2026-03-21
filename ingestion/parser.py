@@ -1,15 +1,14 @@
-"""Multimodal document parsers — PyMuPDF, Docling+RapidOCR, RapidOCR.
+"""Multimodal document parsers — PyMuPDF, RapidOCR, python-docx.
 
-Provides layout-aware parsing (Docling) for table-to-markdown reconstruction,
-fast PDF extraction (PyMuPDF), and OCR for scanned images (RapidOCR via
-ONNX Runtime).  Each parser returns a list of text chunks with source
-metadata.
+Provides DOCX parsing (python-docx), fast PDF extraction (PyMuPDF),
+and OCR for scanned images and PDFs (RapidOCR via ONNX Runtime).
+Each parser returns a list of text chunks with source metadata.
 
 Usage::
 
     from ingestion.parser import parse_file
 
-    result = parse_file(Path("report.pdf"), chunk_size=1000)
+    result = parse_file(Path("report.pdf"), chunk_size=2000)
     for chunk in result.chunks:
         print(chunk.text, chunk.metadata)
 """
@@ -104,9 +103,13 @@ def _split_text(
     if not text:
         return []
 
+    # Prefix with filename so document names are searchable
+    prefix = f"[Source: {source.name}]\n"
+
     chunks: list[Chunk] = []
-    for i in range(0, len(text), chunk_size):
-        segment = text[i : i + chunk_size]
+    stride = max(1, chunk_size - 200)  # 200-char overlap
+    for i in range(0, len(text), stride):
+        segment = prefix + text[i : i + chunk_size]
         meta: dict = {
             "source": str(source),
             "filename": source.name,
@@ -157,52 +160,69 @@ class BaseParser(ABC):
 # ── Docling parser (layout-aware, table → markdown) ────────────────────────
 
 
-class DoclingParser(BaseParser):
-    """Layout-aware parser using Docling for tables."""
+class DocxParser(BaseParser):
+    """Lightweight DOCX parser using python-docx.
+
+    Extracts paragraph text and tables as pipe-delimited rows.
+    Much faster than DoclingParser (no ML model loading).
+    """
 
     @property
     def name(self) -> str:
-        return "docling"
+        return "docx"
 
     @property
     def extensions(self) -> set[str]:
         return OFFICE_EXTENSIONS
 
     def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
-        """Parse DOCX using Docling's layout engine.
+        """Parse DOCX using python-docx.
 
         Args:
             path: Path to the document.
             chunk_size: Approximate characters per chunk.
 
         Returns:
-            ParserResult with markdown-formatted chunks.
+            ParserResult with text chunks.
         """
         try:
-            from docling.document_converter import DocumentConverter
+            from docx import Document
         except ImportError as exc:
             return ParserResult(
                 file_path=str(path),
                 success=False,
-                error=f"Docling not installed: {exc}",
+                error=f"python-docx not installed: {exc}",
                 parser_name=self.name,
             )
 
         try:
-            converter = DocumentConverter()
-            result = converter.convert(str(path))
-            markdown_text = result.document.export_to_markdown()
+            doc = Document(str(path))
+            parts: list[str] = []
 
-            chunks = _split_text(markdown_text, path, chunk_size, self.name)
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if text:
+                    parts.append(text)
+
+            for table in doc.tables:
+                rows: list[str] = []
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells]
+                    rows.append(" | ".join(cells))
+                if rows:
+                    parts.append("\n".join(rows))
+
+            full_text = "\n\n".join(parts)
+            chunks = _split_text(full_text, path, chunk_size, self.name)
             return ParserResult(
                 file_path=str(path),
                 chunks=chunks,
                 parser_name=self.name,
-                page_count=result.document.num_pages(),
+                page_count=1,
                 success=True,
             )
         except Exception as exc:
-            logger.error("Docling failed on %s: %s", path, exc)
+            logger.error("DocxParser failed on %s: %s", path, exc)
             return ParserResult(
                 file_path=str(path),
                 success=False,
@@ -225,12 +245,13 @@ class PyMuPDFParser(BaseParser):
     def extensions(self) -> set[str]:
         return PDF_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+    def parse(self, path: Path, chunk_size: int = 2000) -> ParserResult:
         """Extract text from PDF pages using PyMuPDF (fitz).
 
         Args:
             path: Path to the PDF file.
-            chunk_size: Approximate characters per chunk.
+            chunk_size: Approximate characters per chunk (default 2000
+                to keep most pages in a single chunk).
 
         Returns:
             ParserResult with page-level chunks.
@@ -274,40 +295,17 @@ class PyMuPDFParser(BaseParser):
             )
 
 
-# ── Scanned PDF parser (Docling + RapidOCR) ────────────────────────────────
+# ── Scanned PDF parser (PyMuPDF + RapidOCR) ─────────────────────────────────
 
 
 class ScannedPDFParser(BaseParser):
-    """Parser for scanned PDFs using Docling with RapidOCR.
+    """Parser for scanned PDFs using PyMuPDF page rendering + RapidOCR.
 
-    Uses ``RapidOcrOptions`` so Docling's internal OCR uses RapidOCR
-    (ONNX Runtime) instead of Tesseract.  The ``DocumentConverter`` is
-    lazily initialised once per process and cached to avoid reloading
-    ONNX models per file.
+    Renders each page to a greyscale image via PyMuPDF, applies the same
+    variance gate and preprocessing as ``RapidOCRParser``, then runs
+    RapidOCR directly.  Much lighter than Docling (3 ONNX models instead
+    of 5) and processes page-by-page to limit peak memory.
     """
-
-    _converter = None  # class-level lazy singleton
-
-    @classmethod
-    def _get_converter(cls):
-        if cls._converter is None:
-            from docling.datamodel.base_models import InputFormat
-            from docling.datamodel.pipeline_options import (
-                PdfPipelineOptions,
-                RapidOcrOptions,
-            )
-            from docling.document_converter import DocumentConverter, PdfFormatOption
-
-            pipeline_options = PdfPipelineOptions(
-                do_ocr=True,
-                ocr_options=RapidOcrOptions(),
-            )
-            cls._converter = DocumentConverter(
-                format_options={
-                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-                }
-            )
-        return cls._converter
 
     @property
     def name(self) -> str:
@@ -317,26 +315,83 @@ class ScannedPDFParser(BaseParser):
     def extensions(self) -> set[str]:
         return PDF_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
-        """Extract text from a scanned PDF using Docling + RapidOCR.
+    def parse(self, path: Path, chunk_size: int = 2000) -> ParserResult:
+        """Extract text from a scanned PDF via page-level OCR.
 
         Args:
             path: Path to the PDF file.
-            chunk_size: Approximate characters per chunk.
+            chunk_size: Approximate characters per chunk (default 2000
+                to keep most pages in a single chunk).
 
         Returns:
             ParserResult with OCR-extracted chunks.
         """
         try:
-            conv = self._get_converter().convert(str(path))
-            text = conv.document.export_to_markdown()
-            page_count = (
-                len(conv.document.pages) if hasattr(conv.document, "pages") else 0
-            )
-            chunks = _split_text(text, path, chunk_size, self.name)
+            import fitz
+            import numpy as np
+        except ImportError as exc:
             return ParserResult(
                 file_path=str(path),
-                chunks=chunks,
+                success=False,
+                error=f"PyMuPDF/numpy not installed: {exc}",
+                parser_name=self.name,
+            )
+
+        try:
+            engine = RapidOCRParser._get_engine()
+            doc = fitz.open(str(path))
+            all_chunks: list[Chunk] = []
+
+            for page_num, page in enumerate(doc, start=1):
+                pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY)
+                gray = (
+                    np.frombuffer(
+                        pix.samples,
+                        dtype=np.uint8,
+                    )
+                    .reshape(pix.height, pix.width)
+                    .copy()
+                )
+                del pix  # free pixmap immediately
+
+                # Skip blank / near-blank pages
+                if float(gray.var()) < _OCR_VARIANCE_THRESHOLD:
+                    del gray
+                    continue
+
+                # Rescale if needed
+                from PIL import Image
+
+                img = Image.fromarray(gray)
+                del gray  # free numpy array
+                w, h = img.size
+                if w < 800 or w > 3000:
+                    scale = _OCR_TARGET_WIDTH / w
+                    img = img.resize(
+                        (int(w * scale), int(h * scale)),
+                        Image.LANCZOS,
+                    )
+
+                ocr_arr = np.array(img)
+                del img  # free PIL image before inference
+                result, _ = engine(ocr_arr)
+                del ocr_arr  # free numpy array
+                text = "\n".join(line[1] for line in result) if result else ""
+                page_chunks = _split_text(
+                    text,
+                    path,
+                    chunk_size,
+                    self.name,
+                    page=page_num,
+                )
+                all_chunks.extend(page_chunks)
+
+            page_count = len(doc)
+            doc.close()
+
+            return ParserResult(
+                file_path=str(path),
+                chunks=all_chunks,
                 parser_name=self.name,
                 page_count=page_count,
                 success=True,
@@ -428,12 +483,16 @@ class RapidOCRParser(BaseParser):
 
             # Preprocessing: greyscale + rescale to optimal OCR width
             gray = image.convert("L")
+            del image, gray_arr  # free original image + variance array
             w, h = gray.size
             if w < 800 or w > 3000:
                 scale = _OCR_TARGET_WIDTH / w
                 gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-            result, _ = self._get_engine()(np.array(gray))
+            ocr_arr = np.array(gray)
+            del gray  # free PIL image before OCR inference
+            result, _ = self._get_engine()(ocr_arr)
+            del ocr_arr  # free numpy array immediately
             text = "\n".join(line[1] for line in result) if result else ""
             chunks = _split_text(text, path, chunk_size, self.name, page=1)
 
@@ -654,7 +713,7 @@ def is_scanned_pdf(file_path: Path) -> bool:
 # Non-PDF parsers — PDFs are routed dynamically by parse_file().
 _PARSERS: list[BaseParser] = [
     OpenpyxlParser(),
-    DoclingParser(),
+    DocxParser(),
     RapidOCRParser(),
     TextParser(),
     EmlParser(),
@@ -669,12 +728,12 @@ for _p in _PARSERS:
 SUPPORTED_EXTENSIONS = set(_EXT_MAP.keys()) | PDF_EXTENSIONS
 
 
-def parse_file(path: Path, chunk_size: int = 1000) -> ParserResult:
+def parse_file(path: Path, chunk_size: int = 2000) -> ParserResult:
     """Parse a file using the best available parser.
 
     PDFs are routed via a cheap text-density probe:
     - Text-layer PDFs  -> ``PyMuPDFParser`` (fast, no OCR)
-    - Scanned PDFs     -> ``ScannedPDFParser`` (Docling + RapidOCR)
+    - Scanned PDFs     -> ``ScannedPDFParser`` (PyMuPDF + RapidOCR)
 
     All other files are routed by extension via ``_EXT_MAP``.
 

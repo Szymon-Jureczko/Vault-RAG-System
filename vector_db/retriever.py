@@ -24,10 +24,9 @@ import pickle
 from pathlib import Path
 
 import chromadb
-import numpy as np
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import CrossEncoder
 
 from ingestion.config import settings
 
@@ -111,28 +110,21 @@ class HybridRetriever:
         embeddings are numerically identical.
         """
         hub_id = f"sentence-transformers/{model_name}"
-        onnx_cache = (
-            settings.chroma_persist_path.parent / "onnx" / model_name
-        )
+        onnx_cache = settings.chroma_persist_path.parent / "onnx" / model_name
         try:
+            import numpy as np
             from optimum.onnxruntime import ORTModelForFeatureExtraction
             from transformers import AutoTokenizer
 
             if onnx_cache.exists():
-                tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer = AutoTokenizer.from_pretrained(str(onnx_cache))
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
                     str(onnx_cache)
-                )
-                ort_model = (
-                    ORTModelForFeatureExtraction.from_pretrained(
-                        str(onnx_cache)
-                    )
                 )
             else:
                 tokenizer = AutoTokenizer.from_pretrained(hub_id)
-                ort_model = (
-                    ORTModelForFeatureExtraction.from_pretrained(
-                        hub_id, export=True
-                    )
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                    hub_id, export=True
                 )
                 onnx_cache.mkdir(parents=True, exist_ok=True)
                 tokenizer.save_pretrained(str(onnx_cache))
@@ -156,19 +148,17 @@ class HybridRetriever:
                     )
                     out = self._mdl(**enc)
                     mask = enc["attention_mask"]
-                    emb = (
-                        out.last_hidden_state * mask[..., np.newaxis]
-                    ).sum(axis=1) / mask.sum(
-                        axis=-1, keepdims=True
-                    )
+                    emb = (out.last_hidden_state * mask[..., np.newaxis]).sum(
+                        axis=1
+                    ) / mask.sum(axis=-1, keepdims=True)
                     norms = np.linalg.norm(emb, axis=1, keepdims=True)
                     return emb / norms
 
             return _OnnxEmbedder(tokenizer, ort_model)
         except Exception as exc:
-            logger.info(
-                "ONNX unavailable (%s), using PyTorch", exc
-            )
+            from sentence_transformers import SentenceTransformer
+
+            logger.info("ONNX unavailable (%s), using PyTorch", exc)
             return SentenceTransformer(model_name)
 
     def _build_bm25_index(self) -> None:
@@ -250,9 +240,7 @@ class HybridRetriever:
         Returns:
             List of (id, text, metadata, distance) tuples.
         """
-        embedding = self._embedder.encode(
-            [query], show_progress_bar=False
-        )
+        embedding = self._embedder.encode([query], show_progress_bar=False)
         if hasattr(embedding, "tolist"):
             embedding = embedding.tolist()
         results = self._collection.query(
@@ -394,8 +382,8 @@ class HybridRetriever:
         self,
         query_text: str,
         top_k: int = 5,
-        semantic_candidates: int = 20,
-        bm25_candidates: int = 20,
+        semantic_candidates: int = 50,
+        bm25_candidates: int = 50,
     ) -> list[RetrievalResult]:
         """Execute a hybrid search with reranking and citations.
 

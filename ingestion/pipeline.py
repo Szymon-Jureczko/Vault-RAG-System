@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import gc
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -54,6 +56,9 @@ class IngestionStats(BaseModel):
     processed: int = 0
     failed: int = 0
     total_chunks: int = 0
+    current_file: str = ""
+    phase: str = ""
+    files_total: int = 0
 
 
 class BatchCommitter:
@@ -73,7 +78,7 @@ class BatchCommitter:
         self,
         collection,
         embedding_fn,
-        batch_size: int = 100,
+        batch_size: int = 32,
         gc_interval: int = 500,
     ) -> None:
         self._collection = collection
@@ -118,6 +123,12 @@ class BatchCommitter:
         if not self._buffer:
             return 0
 
+        count = len(self._buffer)
+        logger.info(
+            "Embedding %d chunks (%d total so far)",
+            count,
+            self._total_committed + count,
+        )
         ids = [c["id"] for c in self._buffer]
         texts = [c["text"] for c in self._buffer]
         metas = [c["metadata"] for c in self._buffer]
@@ -161,7 +172,7 @@ class BatchCommitter:
 
 
 def _worker(file_path: str, chunk_size: int) -> ParserResult:
-    """Top-level picklable worker for ProcessPoolExecutor.
+    """Worker function for ThreadPoolExecutor.
 
     Args:
         file_path: String path to the document.
@@ -206,8 +217,8 @@ class IngestionPipeline:
         chroma_path: Path | None = None,
         max_workers: int | None = None,
         ocr_workers: int | None = None,
-        batch_size: int = 100,
-        chunk_size: int = 1000,
+        batch_size: int = 32,
+        chunk_size: int = 2000,
     ) -> None:
         self._tracker = tracker or StateTracker()
         self._tracker.init_db()
@@ -226,7 +237,13 @@ class IngestionPipeline:
         Returns:
             Tuple of (collection, embedding_fn).
         """
+        # Limit ONNX Runtime threads to avoid oversubscribing CPU
+        # and reduce memory pressure when OCR models load later.
+        import os
+
         import chromadb
+
+        os.environ.setdefault("ORT_NUM_THREADS", "2")
 
         self._chroma_path.mkdir(parents=True, exist_ok=True)
         client = chromadb.PersistentClient(path=str(self._chroma_path))
@@ -289,13 +306,74 @@ class IngestionPipeline:
 
         return collection, embed_fn
 
+    def _init_embed_fn(self):
+        """Create a fresh embedding function without a new ChromaDB client.
+
+        Reloads only the ONNX/PyTorch embedding model so the caller can
+        reuse an existing ChromaDB collection.
+        """
+        import os
+
+        os.environ.setdefault("ORT_NUM_THREADS", "2")
+
+        try:
+            import numpy as np
+            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from transformers import AutoTokenizer
+
+            _hub_id = f"sentence-transformers/{settings.embedding_model}"
+            _onnx_cache = self._chroma_path.parent / "onnx" / settings.embedding_model
+            if _onnx_cache.exists():
+                tokenizer = AutoTokenizer.from_pretrained(str(_onnx_cache))
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                    str(_onnx_cache)
+                )
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(_hub_id)
+                ort_model = ORTModelForFeatureExtraction.from_pretrained(
+                    _hub_id, export=True
+                )
+                _onnx_cache.mkdir(parents=True, exist_ok=True)
+                tokenizer.save_pretrained(str(_onnx_cache))
+                ort_model.save_pretrained(str(_onnx_cache))
+
+            def embed_fn(texts: list[str]) -> list[list[float]]:
+                encoded = tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="np",
+                )
+                outputs = ort_model(**encoded)
+                mask = encoded["attention_mask"]
+                embeddings = (outputs.last_hidden_state * mask[..., np.newaxis]).sum(
+                    axis=1
+                ) / mask.sum(axis=-1, keepdims=True)
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                embeddings = embeddings / norms
+                return embeddings.tolist()
+
+        except Exception as exc:
+            logger.info("ONNX unavailable (%s), using PyTorch", exc)
+            from sentence_transformers import SentenceTransformer
+
+            model = SentenceTransformer(settings.embedding_model)
+
+            def embed_fn(texts: list[str]) -> list[list[float]]:
+                return model.encode(texts, show_progress_bar=False).tolist()
+
+        return embed_fn
+
     def _run_phase(
         self,
         files: list[Path],
         workers: int,
         batcher: "BatchCommitter",
         stats: IngestionStats,
-    ) -> None:
+        on_progress: Callable[[IngestionStats], None] | None = None,
+        ocr_mode: bool = False,
+    ) -> list[tuple[str, str, dict]]:
         """Parse, embed, and commit one phase of files with per-file state updates.
 
         Each file is marked ``in_progress`` before its worker starts and
@@ -303,38 +381,71 @@ class IngestionPipeline:
         resolves — giving /stats a live count that updates with every file
         rather than only at the end of the phase.
 
+        In ``ocr_mode`` the method only *parses* — it collects chunks
+        and returns them so the caller can unload RapidOCR, reload the
+        embedding model, and embed afterwards.
+
         Args:
             files:   Files to process in this phase.
             workers: Max parallel worker processes for this phase.
             batcher: Shared BatchCommitter; auto-flushes at batch_size.
             stats:   Mutable IngestionStats updated in place.
+            on_progress: Optional callback invoked after each file.
+            ocr_mode: When True, return parsed chunks instead of
+                embedding them (caller handles embedding).
+
+        Returns:
+            In ocr_mode: list of (chunk_id, text, metadata) tuples.
+            Otherwise: empty list.
         """
         if not files:
-            return
+            return []
 
         for fp in files:
             md5 = compute_md5(fp)
             self._tracker.mark_in_progress(str(fp), md5)
 
+        pending_chunks: list[tuple[str, str, dict]] = []
+
         actual_workers = min(workers, len(files))
-        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
             futures = {
                 executor.submit(_worker, str(fp), self._chunk_size): fp for fp in files
             }
             for future in as_completed(futures):
                 fp = futures[future]
+                stats.current_file = fp.name
                 try:
-                    result = future.result()
+                    result = future.result(timeout=300)
+                except TimeoutError:
+                    logger.error("Worker timed out for %s", fp)
+                    self._tracker.mark_failed(str(fp), error="Parser timed out (>300s)")
+                    stats.failed += 1
+                    if on_progress:
+                        on_progress(stats)
+                    continue
                 except Exception as exc:
                     logger.error("Worker error for %s: %s", fp, exc)
                     self._tracker.mark_failed(str(fp), error=str(exc))
                     stats.failed += 1
+                    if on_progress:
+                        on_progress(stats)
                     continue
 
                 if result.success and result.chunks:
                     batcher.delete_for_file(fp.name)
-                    for chunk in result.chunks:
-                        batcher.add(chunk.chunk_id, chunk.text, chunk.metadata)
+                    if ocr_mode:
+                        for chunk in result.chunks:
+                            pending_chunks.append(
+                                (chunk.chunk_id, chunk.text, chunk.metadata)
+                            )
+                    else:
+                        for chunk in result.chunks:
+                            batcher.add(
+                                chunk.chunk_id,
+                                chunk.text,
+                                chunk.metadata,
+                            )
                     self._tracker.mark_completed(
                         str(fp), vector_id=result.chunks[0].chunk_id
                     )
@@ -351,9 +462,20 @@ class IngestionPipeline:
                     )
                     stats.failed += 1
 
-        batcher.flush()
+                if on_progress:
+                    on_progress(stats)
+                time.sleep(0)  # yield GIL so API can serve requests
 
-    def run(self, source_dir: Path) -> IngestionStats:
+        if not ocr_mode:
+            batcher.flush()
+
+        return pending_chunks
+
+    def run(
+        self,
+        source_dir: Path,
+        on_progress: Callable[[IngestionStats], None] | None = None,
+    ) -> IngestionStats:
         """Execute the two-phase ingestion pipeline.
 
         First purges stale state-DB records and ChromaDB chunks for files
@@ -426,22 +548,83 @@ class IngestionPipeline:
             )
 
         # ── Phase 1: fast formats ────────────────────────────────────────
+        stats.files_total = len(fast_files) + len(ocr_files)
+        stats.phase = "fast"
         logger.info(
             "Phase 1 start: %d fast files with %d workers",
             len(fast_files),
             self._max_workers,
         )
-        self._run_phase(fast_files, self._max_workers, batcher, stats)
+        self._run_phase(
+            fast_files,
+            self._max_workers,
+            batcher,
+            stats,
+            on_progress,
+        )
 
-        # ── Phase 2: OCR / image files ──────────────────────────────────
+        # ── Phase 2: OCR / image files (mini-batches to cap memory) ──
+        _OCR_BATCH = 10
         if ocr_files:
+            # Flush remaining Phase 1 chunks then unload the embedding
+            # model (~300 MB) so RapidOCR's ONNX models (~400 MB) can
+            # fit in memory alongside ChromaDB.
+            batcher.flush()
+            batcher._embed = None
+            del embed_fn
+            gc.collect()
+            logger.info("Embedding model unloaded to free memory for OCR")
+
+            stats.phase = "ocr"
             logger.info(
-                "Phase 2 start: %d OCR files with %d workers",
+                "Phase 2 start: %d OCR files with %d workers " "(batches of %d)",
                 len(ocr_files),
                 self._ocr_workers,
+                _OCR_BATCH,
             )
-            self._run_phase(ocr_files, self._ocr_workers, batcher, stats)
 
+            for batch_start in range(0, len(ocr_files), _OCR_BATCH):
+                batch = ocr_files[batch_start : batch_start + _OCR_BATCH]
+                logger.info(
+                    "OCR batch %d–%d of %d",
+                    batch_start + 1,
+                    batch_start + len(batch),
+                    len(ocr_files),
+                )
+
+                # Parse this batch (no embedding)
+                pending = self._run_phase(
+                    batch,
+                    self._ocr_workers,
+                    batcher,
+                    stats,
+                    on_progress,
+                    ocr_mode=True,
+                )
+
+                # Free RapidOCR models before loading embedder
+                from ingestion.parser import RapidOCRParser
+
+                RapidOCRParser._engine = None
+                gc.collect()
+
+                # Reload embedding model (reuses existing collection)
+                batch_embed_fn = self._init_embed_fn()
+                batcher._embed = batch_embed_fn
+
+                if pending:
+                    logger.info("Embedding %d OCR chunks", len(pending))
+                    for chunk_id, text, metadata in pending:
+                        batcher.add(chunk_id, text, metadata)
+                    batcher.flush()
+
+                # Unload embedding model for next OCR batch
+                batcher._embed = None
+                del batch_embed_fn
+                gc.collect()
+
+        stats.current_file = ""
+        stats.phase = "done"
         batcher.finalize()
 
         logger.info(

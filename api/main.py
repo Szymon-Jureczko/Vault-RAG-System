@@ -10,7 +10,10 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import logging
+import multiprocessing as mp
+import os
 import threading
 import uuid as _uuid
 from pathlib import Path
@@ -19,7 +22,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from ingestion.config import settings
-from ingestion.pipeline import IngestionPipeline, IngestionStats
+from ingestion.pipeline import IngestionStats
 from ingestion.state_tracker import StateTracker
 from vector_db.retriever import HybridRetriever, RetrievalResult
 
@@ -35,7 +38,6 @@ app = FastAPI(
 # ── Lazy singletons ─────────────────────────────────────────────────────────
 
 _retriever: HybridRetriever | None = None
-_pipeline: IngestionPipeline | None = None
 
 
 def _get_retriever() -> HybridRetriever:
@@ -44,14 +46,6 @@ def _get_retriever() -> HybridRetriever:
     if _retriever is None:
         _retriever = HybridRetriever()
     return _retriever
-
-
-def _get_pipeline() -> IngestionPipeline:
-    """Lazily initialise the IngestionPipeline singleton."""
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = IngestionPipeline()
-    return _pipeline
 
 
 # ── Request / Response schemas ──────────────────────────────────────────────
@@ -103,7 +97,7 @@ class StatsResponse(BaseModel):
 
 # ── Background job store ──────────────────────────────────────────────────
 
-_sync_jobs: dict[str, SyncResponse] = {}
+_sync_jobs: dict[str, str] = {}  # job_id -> progress file path
 _sync_lock = threading.Lock()
 
 
@@ -116,7 +110,7 @@ class QueryRequest(BaseModel):
     """
 
     question: str
-    top_k: int = 5
+    top_k: int = 10
 
 
 class CitationOut(BaseModel):
@@ -161,6 +155,71 @@ class QueryResponse(BaseModel):
     answer: str = ""
 
 
+# ── Sync worker (runs in a subprocess — its own GIL) ─────────────────────
+
+
+def _sync_worker(source_dir: str, job_id: str, progress_file: str) -> None:
+    """Ingestion worker that runs in a separate process.
+
+    Writes progress snapshots to a JSON file so the API server
+    (which has its own GIL) can serve poll requests without blocking.
+    """
+    from ingestion.pipeline import IngestionPipeline
+
+    def _write(status: str, stats: IngestionStats | None) -> None:
+        data: dict = {"status": status, "job_id": job_id}
+        if stats is not None:
+            data["stats"] = stats.model_dump()
+        tmp = progress_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, progress_file)
+
+    try:
+        pipeline = IngestionPipeline()
+        stats = pipeline.run(
+            Path(source_dir),
+            on_progress=lambda s: _write("running", s),
+        )
+        pipeline.close()
+        _write("completed", stats)
+    except Exception as exc:
+        logger.error("Sync worker %s failed: %s", job_id, exc)
+        _write(f"failed: {exc}", None)
+
+
+def _wait_and_refresh(
+    proc: mp.Process,
+    job_id: str,
+    progress_file: str,
+) -> None:
+    """Wait for sync process to exit, then refresh retriever index."""
+    proc.join()
+
+    # Detect subprocess crash (OOM kill, segfault, etc.)
+    if proc.exitcode and proc.exitcode != 0:
+        logger.error(
+            "Sync worker %s crashed with exit code %d",
+            job_id,
+            proc.exitcode,
+        )
+        data = {
+            "status": f"failed: process killed (exit code {proc.exitcode})",
+            "job_id": job_id,
+        }
+        tmp = progress_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, progress_file)
+        return
+
+    try:
+        _get_retriever().refresh_index()
+        logger.info("BM25 index refreshed after sync %s", job_id)
+    except Exception as exc:
+        logger.error("Index refresh failed after sync %s: %s", job_id, exc)
+
+
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
@@ -185,37 +244,29 @@ def sync_documents(request: SyncRequest) -> SyncResponse:
         )
 
     job_id = _uuid.uuid4().hex[:12]
-    job = SyncResponse(status="running", job_id=job_id)
+    progress_file = str(settings.chroma_persist_path.parent / f".sync_{job_id}.json")
     with _sync_lock:
-        _sync_jobs[job_id] = job
+        _sync_jobs[job_id] = progress_file
 
-    def _run_sync() -> None:
-        try:
-            pipeline = _get_pipeline()
-            stats = pipeline.run(source)
-            _get_retriever().refresh_index()
-            with _sync_lock:
-                _sync_jobs[job_id] = SyncResponse(
-                    status="completed",
-                    job_id=job_id,
-                    stats=stats,
-                )
-        except Exception as exc:
-            logger.error("Sync job %s failed: %s", job_id, exc)
-            with _sync_lock:
-                _sync_jobs[job_id] = SyncResponse(
-                    status=f"failed: {exc}",
-                    job_id=job_id,
-                )
+    ctx = mp.get_context("spawn")
+    proc = ctx.Process(
+        target=_sync_worker,
+        args=(str(source), job_id, progress_file),
+    )
+    proc.start()
 
-    thread = threading.Thread(target=_run_sync, daemon=True)
-    thread.start()
+    # Background thread waits for process exit then refreshes index
+    threading.Thread(
+        target=_wait_and_refresh,
+        args=(proc, job_id, progress_file),
+        daemon=True,
+    ).start()
 
-    return job
+    return SyncResponse(status="running", job_id=job_id)
 
 
 @app.get("/sync/{job_id}", response_model=SyncResponse)
-def sync_status(job_id: str) -> SyncResponse:
+async def sync_status(job_id: str) -> SyncResponse:
     """Check the status of a background sync job.
 
     Args:
@@ -225,10 +276,21 @@ def sync_status(job_id: str) -> SyncResponse:
         SyncResponse with current status and stats (when complete).
     """
     with _sync_lock:
-        job = _sync_jobs.get(job_id)
-    if job is None:
+        progress_file = _sync_jobs.get(job_id)
+    if progress_file is None:
         raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
-    return job
+    try:
+        raw = Path(progress_file).read_text()
+        data = json.loads(raw)
+        stats_data = data.get("stats")
+        stats = IngestionStats(**stats_data) if stats_data else None
+        return SyncResponse(
+            status=data["status"],
+            job_id=job_id,
+            stats=stats,
+        )
+    except (FileNotFoundError, json.JSONDecodeError):
+        return SyncResponse(status="running", job_id=job_id)
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -288,7 +350,9 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     # ── Optional LLM answer generation ──────────────────────────────
     answer = ""
     if results:
-        answer = _generate_answer(request.question, results)
+        # Send only the top 5 chunks to the LLM to keep context small
+        # enough for CPU inference.  All 10 are still shown as citations.
+        answer = _generate_answer(request.question, results[:5])
 
     return QueryResponse(
         question=request.question,
@@ -314,9 +378,12 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
 
     prompt = (
         "You are a research assistant. Answer the question based ONLY on "
-        "the provided context. If the context does not contain enough "
-        "information, say so. Cite the source filename and page for each "
-        "claim.\n\n"
+        "the provided context. Rules:\n"
+        "- If the context contains a list, enumeration, or bibliography, "
+        "reproduce ALL items from ALL context chunks — never truncate.\n"
+        "- Merge information from multiple chunks of the same document.\n"
+        "- If the context does not contain enough information, say so.\n"
+        "- Cite the source filename and page for each claim.\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n\nAnswer:"
     )
@@ -330,8 +397,12 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
                 "model": settings.ollama_model_dev,
                 "prompt": prompt,
                 "stream": False,
+                "options": {
+                    "num_ctx": 4096,
+                    "num_predict": 1024,
+                },
             },
-            timeout=120.0,
+            timeout=180.0,
         )
         response.raise_for_status()
         return response.json().get("response", "")
@@ -341,7 +412,7 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
 
 
 @app.get("/health")
-def health_check() -> dict:
+async def health_check() -> dict:
     """Health check endpoint.
 
     Returns:

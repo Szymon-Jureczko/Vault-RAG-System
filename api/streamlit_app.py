@@ -27,51 +27,74 @@ with st.sidebar:
     source_dir = st.text_input("Source directory", value="data/")
 
     if st.button("Sync Documents", type="primary"):
-        with st.spinner("Running incremental ingestion..."):
-            try:
-                # Kick off background job
-                resp = requests.post(
-                    f"{API_BASE}/sync",
-                    json={"source_dir": source_dir},
-                    timeout=30,
+        status_text = st.empty()
+        progress_bar = st.empty()
+        try:
+            # Kick off background job
+            resp = requests.post(
+                f"{API_BASE}/sync",
+                json={"source_dir": source_dir},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            job = resp.json()
+            job_id = job["job_id"]
+
+            # Poll until complete
+            while True:
+                time.sleep(3)
+                poll = requests.get(
+                    f"{API_BASE}/sync/{job_id}", timeout=120,
                 )
-                resp.raise_for_status()
-                job = resp.json()
-                job_id = job["job_id"]
+                poll.raise_for_status()
+                data = poll.json()
 
-                # Poll until complete
-                while True:
-                    time.sleep(3)
-                    poll = requests.get(f"{API_BASE}/sync/{job_id}", timeout=10)
-                    poll.raise_for_status()
-                    data = poll.json()
-                    if not data["status"].startswith("running"):
-                        break
-
-                if data["status"] != "completed":
-                    st.error(f"Sync failed: {data['status']}")
-                else:
-                    stats = data["stats"]
-                    st.success("Sync complete")
-
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Processed", stats["processed"])
-                    col2.metric("Skipped", stats["skipped_unchanged"])
-                    col3.metric("Failed", stats["failed"])
-
-                    st.metric("Total Chunks", stats["total_chunks"])
-
-                    total = stats["total_discovered"]
+                # Show live progress while running
+                s = data.get("stats")
+                if s and data["status"] == "running":
+                    done = s.get("processed", 0) + s.get("failed", 0)
+                    total = s.get("files_total", 0)
+                    phase = s.get("phase", "")
+                    cur = s.get("current_file", "")
                     if total > 0:
-                        done = stats["processed"] + stats["skipped_unchanged"]
-                        st.progress(
+                        progress_bar.progress(
                             min(done / total, 1.0),
-                            text=f"{done}/{total} files complete",
+                            text=f"{done}/{total} files",
                         )
-            except requests.ConnectionError:
-                st.error("Cannot connect to API server. " "Is it running on port 8000?")
-            except Exception as e:
-                st.error(f"Sync failed: {e}")
+                    status_text.text(
+                        f"Phase: {phase} | Processing: {cur}"
+                    )
+
+                if not data["status"].startswith("running"):
+                    break
+
+            status_text.empty()
+            progress_bar.empty()
+
+            if data["status"] != "completed":
+                st.error(f"Sync failed: {data['status']}")
+            else:
+                stats = data["stats"]
+                st.success("Sync complete")
+
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Processed", stats["processed"])
+                col2.metric("Skipped", stats["skipped_unchanged"])
+                col3.metric("Failed", stats["failed"])
+
+                st.metric("Total Chunks", stats["total_chunks"])
+
+                total = stats["total_discovered"]
+                if total > 0:
+                    done = stats["processed"] + stats["skipped_unchanged"]
+                    st.progress(
+                        min(done / total, 1.0),
+                        text=f"{done}/{total} files complete",
+                    )
+        except requests.ConnectionError:
+            st.error("Cannot connect to API server. " "Is it running on port 8000?")
+        except Exception as e:
+            st.error(f"Sync failed: {e}")
 
     st.divider()
 
@@ -121,8 +144,8 @@ if question := st.chat_input("Ask a question about your documents..."):
             try:
                 resp = requests.post(
                     f"{API_BASE}/query",
-                    json={"question": question, "top_k": 5},
-                    timeout=120,
+                    json={"question": question, "top_k": 10},
+                    timeout=200,
                 )
                 resp.raise_for_status()
                 data = resp.json()

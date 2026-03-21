@@ -224,7 +224,7 @@ class StateTracker:
     def mark_completed(
         self,
         file_path: str | Path,
-        vector_id: str,
+        vector_id: str | None = None,
     ) -> None:
         """Record that *file_path* was successfully embedded.
 

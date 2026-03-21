@@ -49,8 +49,8 @@ class Settings(BaseSettings):
     state_db_path: Path = Path("data/state.db")
 
     # ── Concurrency ─────────────────────────────────────────────────────────
-    max_workers: int = 8  # non-OCR parsers (XLSX, EML, PDF, DOCX)
-    ocr_workers: int = 2  # OCR/image parsers (memory-constrained)
+    max_workers: int = 4  # non-OCR parsers (leave cores for API + embeddings)
+    ocr_workers: int = 1  # OCR/image parsers — sequential is safer on 16 GB
 
     # ── Batch / OOM-safety ──────────────────────────────────────────────────
     batch_commit_size: int = 500

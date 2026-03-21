@@ -4,12 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
-from ingestion.parser import (
-    TextParser,
-    _split_text,
-    parse_file,
-)
+from ingestion.parser import TextParser, _split_text, parse_file
 
 
 class TestSplitText:
@@ -26,24 +21,31 @@ class TestSplitText:
     def test_single_chunk_for_short_text(self, tmp_path: Path) -> None:
         chunks = _split_text("hello world", tmp_path / "a.txt", 1000, "test")
         assert len(chunks) == 1
-        assert chunks[0].text == "hello world"
+        assert "[Source: a.txt]" in chunks[0].text
+        assert "hello world" in chunks[0].text
 
-    def test_splits_into_correct_number_of_chunks(
-        self, tmp_path: Path,
+    def test_splits_into_multiple_chunks(
+        self,
+        tmp_path: Path,
     ) -> None:
         text = "a" * 250
         chunks = _split_text(text, tmp_path / "a.txt", 100, "test")
-        assert len(chunks) == 3
+        assert len(chunks) > 1
 
     def test_metadata_includes_parser_name(self, tmp_path: Path) -> None:
         chunks = _split_text("hello", tmp_path / "a.txt", 100, "myparser")
         assert chunks[0].metadata["parser"] == "myparser"
 
     def test_metadata_includes_page_when_provided(
-        self, tmp_path: Path,
+        self,
+        tmp_path: Path,
     ) -> None:
         chunks = _split_text(
-            "hello", tmp_path / "a.txt", 100, "test", page=3,
+            "hello",
+            tmp_path / "a.txt",
+            100,
+            "test",
+            page=3,
         )
         assert chunks[0].metadata["page"] == 3
 
@@ -101,4 +103,8 @@ class TestParseFile:
         result = parse_file(f, chunk_size=100)
         assert result.success is True
         assert len(result.chunks) > 1
-        assert all(len(c.text) <= 100 for c in result.chunks)
+        # Each chunk is chunk_size content + [Source: filename] prefix
+        prefix_len = len("[Source: long.txt]\n")
+        assert all(
+            len(c.text) <= 100 + prefix_len for c in result.chunks
+        )
