@@ -1,0 +1,29 @@
+{
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+  "typeCheckingMode": "basic",
+  "exclude": [
+    "data/**",
+    "**/__pycache__/**",
+    "**/*.pyc"
+  ],
+  "ignore": [
+    "**/site-packages/torch/**",
+    "**/site-packages/torchvision/**",
+    "**/site-packages/torchaudio/**",
+    "**/site-packages/transformers/**",
+    "**/site-packages/sentence_transformers/**",
+    "**/site-packages/chromadb/**",
+    "**/site-packages/onnxruntime/**",
+    "**/site-packages/optimum/**",
+    "**/site-packages/safetensors/**",
+    "**/site-packages/tokenizers/**",
+    "**/site-packages/bm25s/**",
+    "**/site-packages/huggingface_hub/**"
+  ],
+  "reportMissingModuleSource": "none",
+  "reportMissingImports": "warning",
+  "reportUnknownMemberType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownParameterType": "none"
+}
