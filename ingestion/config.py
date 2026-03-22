@@ -7,7 +7,9 @@ or real environment variables without touching source code.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +28,12 @@ class Settings(BaseSettings):
         batch_commit_size: Number of vectors to buffer before committing
             to ChromaDB.  Also the interval for ``gc.collect()`` calls.
         app_env: Current environment (development / production).
+        ingestion_source: Where to read documents from. ``'LOCAL'`` reads from
+            the filesystem; ``'AZURE'`` downloads from Azure Blob Storage.
+        azure_storage_connection_string: Azure storage account connection
+            string.  Required when ``ingestion_source`` is ``'AZURE'``.
+        azure_container_name: Name of the Azure blob container to ingest from.
+            Required when ``ingestion_source`` is ``'AZURE'``.
     """
 
     model_config = SettingsConfigDict(
@@ -50,13 +58,35 @@ class Settings(BaseSettings):
 
     # ── Concurrency ─────────────────────────────────────────────────────────
     max_workers: int = 4  # non-OCR parsers (leave cores for API + embeddings)
-    ocr_workers: int = 2  # OCR/image parsers (parse-then-embed to avoid OOM)
+    ocr_workers: int = 1  # OCR/image parsers — sequential is safer on 16 GB
 
     # ── Batch / OOM-safety ──────────────────────────────────────────────────
     batch_commit_size: int = 500
 
     # ── App ──────────────────────────────────────────────────────────────────
     app_env: str = "development"
+
+    # ── Ingestion Source ─────────────────────────────────────────────────────
+    ingestion_source: Literal["LOCAL", "AZURE"] = "LOCAL"
+
+    # ── Azure Blob Storage (only required when ingestion_source = 'AZURE') ───
+    azure_storage_connection_string: str = ""
+    azure_container_name: str = ""
+
+    @field_validator("ingestion_source", mode="before")
+    @classmethod
+    def _normalise_ingestion_source(cls, v: object) -> str:
+        """Uppercase so 'azure' and 'AZURE' are equivalent.
+
+        Args:
+            v: Raw value from environment variable.
+
+        Returns:
+            Uppercased string value.
+        """
+        if isinstance(v, str):
+            return v.upper()
+        return v  # type: ignore[return-value]
 
 
 settings = Settings()

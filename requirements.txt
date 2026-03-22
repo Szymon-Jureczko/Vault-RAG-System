@@ -12,8 +12,9 @@ chromadb>=0.5
 
 # ── Document Parsers ──────────────────────────────────────────────────────────
 pymupdf>=1.24                         # PyMuPDF — fast PDF extraction
-docling>=2.0                          # layout-aware parsing
-pytesseract>=0.3                      # Tesseract OCR wrapper (system tesseract required)
+docling>=2.0                          # layout-aware parsing (scanned PDFs via RapidOCR)
+rapidocr-onnxruntime>=1.3             # ONNX-based OCR; 3-10x faster than Tesseract on CPU
+pytesseract>=0.3                      # kept as fallback; replaced by rapidocr in hot path
 
 # ── State DB / incremental logic ─────────────────────────────────────────────
 # SQLite ships with Python stdlib — no package needed.
@@ -21,14 +22,26 @@ pytesseract>=0.3                      # Tesseract OCR wrapper (system tesseract 
 pydantic>=2.0
 pydantic-settings>=2.0
 
-# ── API Server ────────────────────────────────────────────────────────────────
+# ── Retrieval (Phase 3) ──────────────────────────────────────────────────────
+rank-bm25>=0.2                         # BM25 keyword search
+
+# ── API Server (Phase 4) ─────────────────────────────────────────────────────
 fastapi>=0.115
 uvicorn[standard]>=0.30
+streamlit>=1.35                        # Researcher Dashboard
+
+# ── Evaluation (Phase 5) ─────────────────────────────────────────────────────
+ragas>=0.1
+datasets>=2.18
+
+# ── Azure Blob Storage (optional — only needed when INGESTION_SOURCE=AZURE) ────
+azure-storage-blob>=12.0
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0
 tenacity>=8.0
 httpx>=0.27
+Pillow>=10.0                           # Tesseract OCR image loading
 
 # ── Dev / Notebook ────────────────────────────────────────────────────────────
 jupyterlab>=4.0

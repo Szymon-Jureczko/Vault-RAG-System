@@ -38,6 +38,8 @@ RUN groupadd --gid ${USER_GID} ${USERNAME} \
     && chmod 0440 /etc/sudoers.d/${USERNAME} \
     && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /home/${USERNAME}/.cache && chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}/.cache
+
 USER ${USERNAME}
 
 # Add user-local bin to PATH (for pip-installed CLIs)

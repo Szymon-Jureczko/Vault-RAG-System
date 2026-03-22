@@ -1,1 +1,1 @@
-"""Ingestion package — document parsing, state tracking, and vector persistence."""
+"""Ingestion package — parsers, state tracking, vector persistence."""

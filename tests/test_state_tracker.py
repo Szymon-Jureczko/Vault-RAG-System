@@ -1,6 +1,5 @@
 """Tests for ingestion.state_tracker — SQLite state management."""
 
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -125,7 +124,9 @@ class TestNeedsProcessing:
         sample_file.write_text("different content now")
         assert tracker.needs_processing(sample_file) is True
 
-    def test_failed_needs_retry(self, tracker: StateTracker, sample_file: Path) -> None:
+    def test_failed_needs_retry(
+        self, tracker: StateTracker, sample_file: Path,
+    ) -> None:
         h = compute_md5(sample_file)
         tracker.mark_in_progress(str(sample_file), h)
         tracker.mark_failed(str(sample_file), error="oops")

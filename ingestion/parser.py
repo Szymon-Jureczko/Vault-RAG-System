@@ -8,7 +8,7 @@ Usage::
 
     from ingestion.parser import parse_file
 
-    result = parse_file(Path("report.pdf"), chunk_size=1000)
+    result = parse_file(Path("report.pdf"), chunk_size=2000)
     for chunk in result.chunks:
         print(chunk.text, chunk.metadata)
 """
@@ -344,19 +344,26 @@ class ScannedPDFParser(BaseParser):
 
             for page_num, page in enumerate(doc, start=1):
                 pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY)
-                gray = np.frombuffer(
-                    pix.samples,
-                    dtype=np.uint8,
-                ).reshape(pix.height, pix.width)
+                gray = (
+                    np.frombuffer(
+                        pix.samples,
+                        dtype=np.uint8,
+                    )
+                    .reshape(pix.height, pix.width)
+                    .copy()
+                )
+                del pix  # free pixmap immediately
 
                 # Skip blank / near-blank pages
                 if float(gray.var()) < _OCR_VARIANCE_THRESHOLD:
+                    del gray
                     continue
 
                 # Rescale if needed
                 from PIL import Image
 
                 img = Image.fromarray(gray)
+                del gray  # free numpy array
                 w, h = img.size
                 if w < 800 or w > 3000:
                     scale = _OCR_TARGET_WIDTH / w
@@ -365,7 +372,10 @@ class ScannedPDFParser(BaseParser):
                         Image.LANCZOS,
                     )
 
-                result, _ = engine(np.array(img))
+                ocr_arr = np.array(img)
+                del img  # free PIL image before inference
+                result, _ = engine(ocr_arr)
+                del ocr_arr  # free numpy array
                 text = "\n".join(line[1] for line in result) if result else ""
                 page_chunks = _split_text(
                     text,
@@ -473,12 +483,16 @@ class RapidOCRParser(BaseParser):
 
             # Preprocessing: greyscale + rescale to optimal OCR width
             gray = image.convert("L")
+            del image, gray_arr  # free original image + variance array
             w, h = gray.size
             if w < 800 or w > 3000:
                 scale = _OCR_TARGET_WIDTH / w
                 gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-            result, _ = self._get_engine()(np.array(gray))
+            ocr_arr = np.array(gray)
+            del gray  # free PIL image before OCR inference
+            result, _ = self._get_engine()(ocr_arr)
+            del ocr_arr  # free numpy array immediately
             text = "\n".join(line[1] for line in result) if result else ""
             chunks = _split_text(text, path, chunk_size, self.name, page=1)
 
@@ -714,7 +728,7 @@ for _p in _PARSERS:
 SUPPORTED_EXTENSIONS = set(_EXT_MAP.keys()) | PDF_EXTENSIONS
 
 
-def parse_file(path: Path, chunk_size: int = 1000) -> ParserResult:
+def parse_file(path: Path, chunk_size: int = 2000) -> ParserResult:
     """Parse a file using the best available parser.
 
     PDFs are routed via a cheap text-density probe:
