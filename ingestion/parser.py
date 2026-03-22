@@ -19,6 +19,7 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -86,6 +87,7 @@ def _split_text(
     chunk_size: int,
     parser_name: str,
     page: int | None = None,
+    overlap: int = 200,
 ) -> list[Chunk]:
     """Split text into fixed-size chunks with metadata.
 
@@ -95,6 +97,7 @@ def _split_text(
         chunk_size: Target characters per chunk.
         parser_name: Name of the parser that produced the text.
         page: Optional page number for page-level chunks.
+        overlap: Characters of overlap between consecutive chunks.
 
     Returns:
         List of Chunk instances.
@@ -107,7 +110,7 @@ def _split_text(
     prefix = f"[Source: {source.name}]\n"
 
     chunks: list[Chunk] = []
-    stride = max(1, chunk_size - 200)  # 200-char overlap
+    stride = max(1, chunk_size - overlap)
     for i in range(0, len(text), stride):
         segment = prefix + text[i : i + chunk_size]
         meta: dict = {
@@ -145,12 +148,13 @@ class BaseParser(ABC):
         """File extensions this parser handles (lowercase, with dot)."""
 
     @abstractmethod
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+    def parse(self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 200) -> ParserResult:
         """Parse a document into text chunks.
 
         Args:
             path: Path to the source file.
             chunk_size: Approximate characters per chunk.
+            chunk_overlap: Characters of overlap between consecutive chunks.
 
         Returns:
             ParserResult with extracted chunks.
@@ -267,16 +271,15 @@ class PyMuPDFParser(BaseParser):
             )
 
         try:
-            doc = fitz.open(str(path))
             all_chunks: list[Chunk] = []
-            for page_num, page in enumerate(doc, start=1):
-                text = page.get_text()
-                page_chunks = _split_text(
-                    text, path, chunk_size, self.name, page=page_num
-                )
-                all_chunks.extend(page_chunks)
-            page_count = len(doc)
-            doc.close()
+            with fitz.open(str(path)) as doc:
+                for page_num, page in enumerate(doc, start=1):
+                    text = page.get_text()
+                    page_chunks = _split_text(
+                        text, path, chunk_size, self.name, page=page_num
+                    )
+                    all_chunks.extend(page_chunks)
+                page_count = len(doc)
 
             return ParserResult(
                 file_path=str(path),
@@ -339,55 +342,53 @@ class ScannedPDFParser(BaseParser):
 
         try:
             engine = RapidOCRParser._get_engine()
-            doc = fitz.open(str(path))
             all_chunks: list[Chunk] = []
-
-            for page_num, page in enumerate(doc, start=1):
-                pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY)
-                gray = (
-                    np.frombuffer(
-                        pix.samples,
-                        dtype=np.uint8,
+            with fitz.open(str(path)) as doc:
+                for page_num, page in enumerate(doc, start=1):
+                    pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY)
+                    gray = (
+                        np.frombuffer(
+                            pix.samples,
+                            dtype=np.uint8,
+                        )
+                        .reshape(pix.height, pix.width)
+                        .copy()
                     )
-                    .reshape(pix.height, pix.width)
-                    .copy()
-                )
-                del pix  # free pixmap immediately
+                    del pix  # free pixmap immediately
 
-                # Skip blank / near-blank pages
-                if float(gray.var()) < _OCR_VARIANCE_THRESHOLD:
-                    del gray
-                    continue
+                    # Skip blank / near-blank pages
+                    if float(gray.var()) < _OCR_VARIANCE_THRESHOLD:
+                        del gray
+                        continue
 
-                # Rescale if needed
-                from PIL import Image
+                    # Rescale if needed
+                    from PIL import Image
 
-                img = Image.fromarray(gray)
-                del gray  # free numpy array
-                w, h = img.size
-                if w < 800 or w > 3000:
-                    scale = _OCR_TARGET_WIDTH / w
-                    img = img.resize(
-                        (int(w * scale), int(h * scale)),
-                        Image.LANCZOS,
+                    img = Image.fromarray(gray)
+                    del gray  # free numpy array
+                    w, h = img.size
+                    if w < 800 or w > 3000:
+                        scale = _OCR_TARGET_WIDTH / w
+                        img = img.resize(
+                            (int(w * scale), int(h * scale)),
+                            Image.LANCZOS,
+                        )
+
+                    ocr_arr = np.array(img)
+                    del img  # free PIL image before inference
+                    result, _ = engine(ocr_arr)
+                    del ocr_arr  # free numpy array
+                    text = "\n".join(line[1] for line in result) if result else ""
+                    page_chunks = _split_text(
+                        text,
+                        path,
+                        chunk_size,
+                        self.name,
+                        page=page_num,
                     )
+                    all_chunks.extend(page_chunks)
 
-                ocr_arr = np.array(img)
-                del img  # free PIL image before inference
-                result, _ = engine(ocr_arr)
-                del ocr_arr  # free numpy array
-                text = "\n".join(line[1] for line in result) if result else ""
-                page_chunks = _split_text(
-                    text,
-                    path,
-                    chunk_size,
-                    self.name,
-                    page=page_num,
-                )
-                all_chunks.extend(page_chunks)
-
-            page_count = len(doc)
-            doc.close()
+                page_count = len(doc)
 
             return ParserResult(
                 file_path=str(path),
@@ -416,7 +417,7 @@ class RapidOCRParser(BaseParser):
     overhead) and two fast gates to skip non-text images.
     """
 
-    _engine = None  # class-level lazy singleton per process
+    _engine: Any | None = None  # class-level lazy singleton per process
 
     @classmethod
     def _get_engine(cls):
@@ -699,10 +700,9 @@ def is_scanned_pdf(file_path: Path) -> bool:
     try:
         import fitz
 
-        doc = fitz.open(str(file_path))
-        total_chars = sum(len(page.get_text().strip()) for page in doc)
-        avg = total_chars / max(len(doc), 1)
-        doc.close()
+        with fitz.open(str(file_path)) as doc:
+            total_chars = sum(len(page.get_text().strip()) for page in doc)
+            avg = total_chars / max(len(doc), 1)
         return avg < _PDF_TEXT_THRESHOLD
     except Exception:
         return True  # assume scanned — OCR attempt is safer than losing content

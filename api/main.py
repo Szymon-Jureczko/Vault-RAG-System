@@ -14,10 +14,13 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
 import threading
 import uuid as _uuid
 from pathlib import Path
+from typing import Literal
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -28,6 +31,11 @@ from vector_db.retriever import HybridRetriever, RetrievalResult
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("azure").setLevel(logging.WARNING)
+
+# Strips the "[Source: filename]\n" prefix that parser.py embeds in every
+# chunk at ingestion time, so it is not duplicated in the LLM prompt.
+_SOURCE_PREFIX_RE = re.compile(r"^\[Source:[^\]]*\]\n")
 
 app = FastAPI(
     title="LocalVaultRAG",
@@ -55,10 +63,18 @@ class SyncRequest(BaseModel):
     """Request body for the /sync endpoint.
 
     Attributes:
-        source_dir: Directory path containing documents to ingest.
+        source_dir: Directory path containing documents to ingest (LOCAL mode).
+        ingestion_source: Where to read documents from — ``'LOCAL'`` or ``'AZURE'``.
+        azure_storage_connection_string: Azure storage account connection string.
+            Required when ``ingestion_source`` is ``'AZURE'``.
+        azure_container_name: Name of the Azure blob container to ingest from.
+            Required when ``ingestion_source`` is ``'AZURE'``.
     """
 
     source_dir: str = "data/"
+    ingestion_source: Literal["LOCAL", "AZURE"] = "LOCAL"
+    azure_storage_connection_string: str = ""
+    azure_container_name: str = ""
 
 
 class SyncResponse(BaseModel):
@@ -158,12 +174,28 @@ class QueryResponse(BaseModel):
 # ── Sync worker (runs in a subprocess — its own GIL) ─────────────────────
 
 
-def _sync_worker(source_dir: str, job_id: str, progress_file: str) -> None:
+def _sync_worker(
+    source_dir: str,
+    job_id: str,
+    progress_file: str,
+    ingestion_source: str = "LOCAL",
+    azure_storage_connection_string: str = "",
+    azure_container_name: str = "",
+) -> None:
     """Ingestion worker that runs in a separate process.
 
     Writes progress snapshots to a JSON file so the API server
     (which has its own GIL) can serve poll requests without blocking.
+
+    Env vars for the Azure source are set before any ingestion imports
+    so the ``Settings()`` singleton in the subprocess picks them up.
     """
+    os.environ["INGESTION_SOURCE"] = ingestion_source
+    if azure_storage_connection_string:
+        os.environ["AZURE_STORAGE_CONNECTION_STRING"] = azure_storage_connection_string
+    if azure_container_name:
+        os.environ["AZURE_CONTAINER_NAME"] = azure_container_name
+
     from ingestion.pipeline import IngestionPipeline
 
     def _write(status: str, stats: IngestionStats | None) -> None:
@@ -180,6 +212,9 @@ def _sync_worker(source_dir: str, job_id: str, progress_file: str) -> None:
         stats = pipeline.run(
             Path(source_dir),
             on_progress=lambda s: _write("running", s),
+            ingestion_source=ingestion_source,
+            azure_connection_string=azure_storage_connection_string,
+            azure_container_name=azure_container_name,
         )
         pipeline.close()
         _write("completed", stats)
@@ -237,7 +272,7 @@ def sync_documents(request: SyncRequest) -> SyncResponse:
         SyncResponse with job_id and initial status.
     """
     source = Path(request.source_dir)
-    if not source.is_dir():
+    if request.ingestion_source == "LOCAL" and not source.is_dir():
         raise HTTPException(
             status_code=400,
             detail=f"Source directory not found: {request.source_dir}",
@@ -251,7 +286,14 @@ def sync_documents(request: SyncRequest) -> SyncResponse:
     ctx = mp.get_context("spawn")
     proc = ctx.Process(
         target=_sync_worker,
-        args=(str(source), job_id, progress_file),
+        args=(
+            str(source),
+            job_id,
+            progress_file,
+            request.ingestion_source,
+            request.azure_storage_connection_string,
+            request.azure_container_name,
+        ),
     )
     proc.start()
 
@@ -334,6 +376,10 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     retriever = _get_retriever()
     results = retriever.query(request.question, top_k=request.top_k)
 
+    # Filter to chunks the cross-encoder considers relevant (score > 0).
+    # Negative-score chunks are not useful as citations or LLM context.
+    relevant = [r for r in results if r.score > 0] or results[:1]
+
     result_items = [
         QueryResultOut(
             text=r.text,
@@ -344,15 +390,14 @@ def query_documents(request: QueryRequest) -> QueryResponse:
                 snippet=r.citation.snippet,
             ),
         )
-        for r in results
+        for r in relevant
     ]
 
     # ── Optional LLM answer generation ──────────────────────────────
     answer = ""
-    if results:
-        # Send only the top 5 chunks to the LLM to keep context small
-        # enough for CPU inference.  All 10 are still shown as citations.
-        answer = _generate_answer(request.question, results[:5])
+    if relevant:
+        # Send top 3 to the LLM to keep prompt eval under ~50 s on CPU.
+        answer = _generate_answer(request.question, relevant[:3])
 
     return QueryResponse(
         question=request.question,
@@ -372,7 +417,11 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
         LLM-generated answer string.
     """
     context = "\n\n---\n\n".join(
-        f"[Source: {r.citation.filename}, Page {r.citation.page}]\n{r.text}"
+        "[Source: {fn}{pg}]\n{txt}".format(
+            fn=r.citation.filename,
+            pg=f", Page {r.citation.page}" if r.citation.page is not None else "",
+            txt=_SOURCE_PREFIX_RE.sub("", r.text),
+        )
         for r in results
     )
 
@@ -389,8 +438,6 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
     )
 
     try:
-        import httpx
-
         response = httpx.post(
             f"{settings.ollama_base_url}/api/generate",
             json={
@@ -398,11 +445,13 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "num_ctx": 4096,
-                    "num_predict": 1024,
+                    "num_ctx": settings.llm_num_ctx,
+                    "num_predict": settings.llm_num_predict,
+                    "temperature": settings.llm_temperature,
+                    "num_thread": settings.llm_num_thread,
                 },
             },
-            timeout=180.0,
+            timeout=settings.llm_timeout,
         )
         response.raise_for_status()
         return response.json().get("response", "")

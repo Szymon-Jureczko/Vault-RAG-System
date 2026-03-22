@@ -14,7 +14,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from ingestion.pipeline import (
-    SUPPORTED_EXTENSIONS,
     IngestionPipeline,
     download_azure_blobs,
 )
@@ -321,7 +320,7 @@ class TestIngestionPipelineAzureSource:
             patch("ingestion.pipeline.settings") as mock_settings,
             patch(
                 "ingestion.pipeline.download_azure_blobs",
-                side_effect=lambda _: call_order.append("download"),
+                side_effect=lambda *a, **kw: call_order.append("download"),
             ),
             patch(
                 "ingestion.pipeline.discover_files",

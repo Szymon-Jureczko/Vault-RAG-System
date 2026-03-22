@@ -24,6 +24,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -77,13 +78,13 @@ class BatchCommitter:
 
     def __init__(
         self,
-        collection,
-        embedding_fn,
+        collection: Any,
+        embedding_fn: Callable[[list[str]], list[list[float]]],
         batch_size: int = 32,
         gc_interval: int = 500,
     ) -> None:
         self._collection = collection
-        self._embed = embedding_fn
+        self._embed: Callable[[list[str]], list[list[float]]] | None = embedding_fn
         self._batch_size = batch_size
         self._gc_interval = gc_interval
         self._buffer: list[dict] = []
@@ -133,6 +134,7 @@ class BatchCommitter:
         ids = [c["id"] for c in self._buffer]
         texts = [c["text"] for c in self._buffer]
         metas = [c["metadata"] for c in self._buffer]
+        assert self._embed is not None, "embed function unloaded before flush"
         embeddings = self._embed(texts)
 
         self._collection.add(
@@ -200,14 +202,19 @@ def discover_files(directory: Path) -> list[Path]:
     return sorted(set(files))
 
 
-def download_azure_blobs(dest: Path) -> int:
-    """Download supported blobs from the configured Azure container to a local directory.
+def download_azure_blobs(
+    dest: Path,
+    connection_string: str = "",
+    container_name: str = "",
+) -> int:
+    """Download supported blobs from the configured Azure container to a local dir.
 
-    Reads ``settings.azure_storage_connection_string`` and
-    ``settings.azure_container_name``.  Only blobs whose file-extension
-    suffix is in ``SUPPORTED_EXTENSIONS`` are downloaded; others are
-    silently skipped.  Virtual-directory structure encoded in blob names
-    (e.g. ``"reports/q1/summary.pdf"``) is preserved under *dest*.
+    Uses *connection_string* and *container_name* when supplied; falls back to
+    ``settings.azure_storage_connection_string`` / ``settings.azure_container_name``
+    when not provided.  Only blobs whose file-extension suffix is in
+    ``SUPPORTED_EXTENSIONS`` are downloaded; others are silently skipped.
+    Virtual-directory structure encoded in blob names (e.g.
+    ``"reports/q1/summary.pdf"``) is preserved under *dest*.
 
     Individual blob download failures are logged as warnings and skipped;
     the function continues with remaining blobs and returns the count of
@@ -215,6 +222,10 @@ def download_azure_blobs(dest: Path) -> int:
 
     Args:
         dest: Local directory to write blobs into.  Must already exist.
+        connection_string: Azure storage connection string.  Falls back to
+            ``settings.azure_storage_connection_string`` when empty.
+        container_name: Azure blob container name.  Falls back to
+            ``settings.azure_container_name`` when empty.
 
     Returns:
         Number of blobs successfully downloaded.
@@ -224,22 +235,21 @@ def download_azure_blobs(dest: Path) -> int:
         RuntimeError: If the service client cannot be created or the
             container cannot be listed (connectivity, auth, or not found).
     """
+    connection_string = connection_string or settings.azure_storage_connection_string
+    container_name = container_name or settings.azure_container_name
+
     try:
-        from azure.storage.blob import BlobServiceClient
+        from azure.storage.blob import BlobServiceClient  # type: ignore
     except ImportError as exc:
         raise ImportError(
             "azure-storage-blob is required for Azure ingestion. "
             "Install it with: pip install 'azure-storage-blob>=12.0'"
         ) from exc
 
-    logger.info("Connecting to Azure container '%s'", settings.azure_container_name)
+    logger.info("Connecting to Azure container '%s'", container_name)
     try:
-        service_client = BlobServiceClient.from_connection_string(
-            settings.azure_storage_connection_string
-        )
-        container_client = service_client.get_container_client(
-            settings.azure_container_name
-        )
+        service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = service_client.get_container_client(container_name)
     except Exception as exc:
         raise RuntimeError(
             f"Failed to initialise Azure Blob Storage client: {exc}"
@@ -249,13 +259,13 @@ def download_azure_blobs(dest: Path) -> int:
         blob_list = list(container_client.list_blobs())
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to list blobs in container '{settings.azure_container_name}': {exc}"
+            f"Failed to list blobs in container '{container_name}': {exc}"
         ) from exc
 
     logger.info(
         "Found %d blobs in container '%s'; filtering by supported extensions",
         len(blob_list),
-        settings.azure_container_name,
+        container_name,
     )
 
     downloaded = 0
@@ -277,6 +287,7 @@ def download_azure_blobs(dest: Path) -> int:
             logger.warning(
                 "Failed to download blob '%s': %s — skipping", blob.name, exc
             )
+            local_path.unlink(missing_ok=True)
 
     logger.info(
         "Downloaded %d/%d blobs from '%s'",
@@ -341,7 +352,7 @@ class IngestionPipeline:
         # Try ONNX backend first for faster CPU inference
         try:
             import numpy as np
-            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from optimum.onnxruntime import ORTModelForFeatureExtraction  # type: ignore
             from transformers import AutoTokenizer
 
             _hub_id = f"sentence-transformers/{settings.embedding_model}"
@@ -404,7 +415,7 @@ class IngestionPipeline:
 
         try:
             import numpy as np
-            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from optimum.onnxruntime import ORTModelForFeatureExtraction  # type: ignore
             from transformers import AutoTokenizer
 
             _hub_id = f"sentence-transformers/{settings.embedding_model}"
@@ -455,7 +466,7 @@ class IngestionPipeline:
         self,
         files: list[Path],
         workers: int,
-        batcher: "BatchCommitter",
+        batcher: BatchCommitter,
         stats: IngestionStats,
         on_progress: Callable[[IngestionStats], None] | None = None,
         ocr_mode: bool = False,
@@ -495,62 +506,67 @@ class IngestionPipeline:
 
         actual_workers = min(workers, len(files))
         with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-            futures = {
-                executor.submit(_worker, str(fp), self._chunk_size): fp for fp in files
-            }
-            for future in as_completed(futures):
-                fp = futures[future]
-                stats.current_file = fp.name
-                try:
-                    result = future.result(timeout=300)
-                except TimeoutError:
-                    logger.error("Worker timed out for %s", fp)
-                    self._tracker.mark_failed(str(fp), error="Parser timed out (>300s)")
-                    stats.failed += 1
-                    if on_progress:
-                        on_progress(stats)
-                    continue
-                except Exception as exc:
-                    logger.error("Worker error for %s: %s", fp, exc)
-                    self._tracker.mark_failed(str(fp), error=str(exc))
-                    stats.failed += 1
-                    if on_progress:
-                        on_progress(stats)
-                    continue
+            for i in range(0, len(files), actual_workers):
+                batch_files = files[i : i + actual_workers]
+                futures = {
+                    executor.submit(_worker, str(fp), self._chunk_size): fp
+                    for fp in batch_files
+                }
+                for future in as_completed(futures):
+                    fp = futures[future]
+                    stats.current_file = fp.name
+                    try:
+                        result = future.result(timeout=300)
+                    except TimeoutError:
+                        logger.error("Worker timed out for %s", fp)
+                        self._tracker.mark_failed(
+                            str(fp), error="Parser timed out (>300s)"
+                        )
+                        stats.failed += 1
+                        if on_progress:
+                            on_progress(stats)
+                        continue
+                    except Exception as exc:
+                        logger.error("Worker error for %s: %s", fp, exc)
+                        self._tracker.mark_failed(str(fp), error=str(exc))
+                        stats.failed += 1
+                        if on_progress:
+                            on_progress(stats)
+                        continue
 
-                if result.success and result.chunks:
-                    batcher.delete_for_file(fp.name)
-                    if ocr_mode:
-                        for chunk in result.chunks:
-                            pending_chunks.append(
-                                (chunk.chunk_id, chunk.text, chunk.metadata)
-                            )
+                    if result.success and result.chunks:
+                        batcher.delete_for_file(fp.name)
+                        if ocr_mode:
+                            for chunk in result.chunks:
+                                pending_chunks.append(
+                                    (chunk.chunk_id, chunk.text, chunk.metadata)
+                                )
+                        else:
+                            for chunk in result.chunks:
+                                batcher.add(
+                                    chunk.chunk_id,
+                                    chunk.text,
+                                    chunk.metadata,
+                                )
+                        self._tracker.mark_completed(
+                            str(fp), vector_id=result.chunks[0].chunk_id
+                        )
+                        stats.processed += 1
+                        stats.total_chunks += len(result.chunks)
+                    elif result.success:
+                        # Gated/skipped file (e.g. tiny image) — no
+                        # chunks produced but not an error.
+                        self._tracker.mark_completed(str(fp))
+                        stats.skipped_unchanged += 1
                     else:
-                        for chunk in result.chunks:
-                            batcher.add(
-                                chunk.chunk_id,
-                                chunk.text,
-                                chunk.metadata,
-                            )
-                    self._tracker.mark_completed(
-                        str(fp), vector_id=result.chunks[0].chunk_id
-                    )
-                    stats.processed += 1
-                    stats.total_chunks += len(result.chunks)
-                elif result.success:
-                    # Gated/skipped file (e.g. tiny image) — no
-                    # chunks produced but not an error.
-                    self._tracker.mark_completed(str(fp))
-                    stats.skipped_unchanged += 1
-                else:
-                    self._tracker.mark_failed(
-                        str(fp), error=result.error or "Unknown error"
-                    )
-                    stats.failed += 1
+                        self._tracker.mark_failed(
+                            str(fp), error=result.error or "Unknown error"
+                        )
+                        stats.failed += 1
 
-                if on_progress:
-                    on_progress(stats)
-                time.sleep(0)  # yield GIL so API can serve requests
+                    if on_progress:
+                        on_progress(stats)
+                    time.sleep(0)  # yield GIL so API can serve requests
 
         if not ocr_mode:
             batcher.flush()
@@ -561,6 +577,10 @@ class IngestionPipeline:
         self,
         source_dir: Path,
         on_progress: Callable[[IngestionStats], None] | None = None,
+        *,
+        ingestion_source: str = "",
+        azure_connection_string: str = "",
+        azure_container_name: str = "",
     ) -> IngestionStats:
         """Execute the two-phase ingestion pipeline.
 
@@ -595,25 +615,36 @@ class IngestionPipeline:
             RuntimeError: If the Azure container cannot be reached.
         """
         stats = IngestionStats()
-
-        # ── Azure source: validate config, download blobs to temp dir ─────────
         _tmp_dir: tempfile.TemporaryDirectory | None = None
         effective_dir = source_dir
-        if settings.ingestion_source == "AZURE":
-            if not settings.azure_storage_connection_string:
-                raise ValueError(
-                    "AZURE_STORAGE_CONNECTION_STRING must be set "
-                    "when INGESTION_SOURCE=AZURE"
-                )
-            if not settings.azure_container_name:
-                raise ValueError(
-                    "AZURE_CONTAINER_NAME must be set when INGESTION_SOURCE=AZURE"
-                )
-            _tmp_dir = tempfile.TemporaryDirectory(prefix="rag_azure_")
-            effective_dir = Path(_tmp_dir.name)
-            download_azure_blobs(effective_dir)
+
+        # Resolve ingestion source — explicit params take priority over settings
+        eff_source = (ingestion_source or settings.ingestion_source).upper()
+        eff_conn_str = (
+            azure_connection_string or settings.azure_storage_connection_string
+        )
+        eff_container = azure_container_name or settings.azure_container_name
 
         try:
+            # ── Azure source: validate config, download blobs to temp dir ─────
+            if eff_source == "AZURE":
+                if not eff_conn_str:
+                    raise ValueError(
+                        "AZURE_STORAGE_CONNECTION_STRING must be set "
+                        "when INGESTION_SOURCE=AZURE"
+                    )
+                if not eff_container:
+                    raise ValueError(
+                        "AZURE_CONTAINER_NAME must be set when INGESTION_SOURCE=AZURE"
+                    )
+                _tmp_dir = tempfile.TemporaryDirectory(prefix="rag_azure_")
+                effective_dir = Path(_tmp_dir.name)
+                download_azure_blobs(
+                    effective_dir,
+                    connection_string=eff_conn_str,
+                    container_name=eff_container,
+                )
+
             # ── Discover ──────────────────────────────────────────────────────
             all_files = discover_files(effective_dir)
             stats.total_discovered = len(all_files)
@@ -655,7 +686,12 @@ class IngestionPipeline:
 
             # ── Shared batcher (initialised once, used across both phases) ─────
             collection, embed_fn = self._init_chroma()
-            batcher = BatchCommitter(collection, embed_fn, batch_size=self._batch_size)
+            batcher = BatchCommitter(
+                collection,
+                embed_fn,
+                batch_size=self._batch_size,
+                gc_interval=settings.batch_commit_size,
+            )
 
             # ── Clean up ChromaDB chunks for deleted files ─────────────────────
             for sp in stale_paths:
