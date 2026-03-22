@@ -1,4 +1,4 @@
-# LocalVaultRAG
+# Vault-RAG-System
 
 **Private enterprise RAG system — local LLM inference, flexible document sources**
 
@@ -13,7 +13,7 @@
 <img width="1782" height="937" alt="projimg3" src="https://github.com/user-attachments/assets/fa1036cc-d5ed-410e-b90d-44030c68ecf2" />
 <img width="1292" height="732" alt="projimg4" src="https://github.com/user-attachments/assets/a84cef4a-6cda-418c-8fc8-0da2677880d7" />
 
-LocalVaultRAG ingests thousands of messy enterprise documents — PDFs, Word files, spreadsheets, emails, and scanned images — indexes them with a hybrid search engine, and answers natural-language questions with cited sources. Documents can come from local disk or Azure Blob Storage. All LLM inference and vector search run on your machine via Ollama and ChromaDB — no OpenAI keys, no external AI APIs.
+Vault-RAG-System ingests thousands of messy enterprise documents — PDFs, Word files, spreadsheets, emails, and scanned images — indexes them with a hybrid search engine, and answers natural-language questions with cited sources. Documents can come from local disk or Azure Blob Storage. All LLM inference and vector search run on your machine via Ollama and ChromaDB — no OpenAI keys, no external AI APIs.
 
 Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM.
 
