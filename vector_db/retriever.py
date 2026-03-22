@@ -171,8 +171,10 @@ class HybridRetriever:
         """Build/rebuild the BM25 index from all documents in ChromaDB."""
         all_docs = self._collection.get(include=["documents", "metadatas"])
         self._corpus_ids = all_docs["ids"]
-        self._corpus_texts = all_docs["documents"]
-        self._corpus_metas = all_docs["metadatas"]
+        self._corpus_texts = all_docs["documents"] or []
+        self._corpus_metas = [  # type: ignore[assignment]
+            dict(m) for m in (all_docs["metadatas"] or [])
+        ]
 
         tokenized = [re.findall(r"\w+", doc.lower()) for doc in self._corpus_texts]
         self._bm25 = BM25Okapi(tokenized)
@@ -256,13 +258,16 @@ class HybridRetriever:
         )
 
         items = []
+        docs = results["documents"] or [[]]
+        metas = results["metadatas"] or [[]]
+        dists = results["distances"] or [[]]
         for i in range(len(results["ids"][0])):
             items.append(
                 (
                     results["ids"][0][i],
-                    results["documents"][0][i],
-                    results["metadatas"][0][i],
-                    results["distances"][0][i],
+                    docs[0][i],
+                    metas[0][i],
+                    dists[0][i],
                 )
             )
         return items
@@ -281,6 +286,7 @@ class HybridRetriever:
         """
         if self._bm25 is None:
             self._build_bm25_index()
+            assert self._bm25 is not None
 
         tokens = re.findall(r"\w+", query.lower())
         scores = self._bm25.get_scores(tokens)
@@ -351,6 +357,12 @@ class HybridRetriever:
         if not candidates:
             return []
 
+        candidates = [
+            (cid, t, m, s) for cid, t, m, s in candidates if isinstance(t, str) and t
+        ]
+        if not candidates:
+            return []
+
         pairs = [[query, text] for _, text, _, _ in candidates]
         ce_scores = self._reranker.predict(pairs)
 
@@ -408,14 +420,12 @@ class HybridRetriever:
                 logger.debug("Filename metadata lookup failed for %s: %s", fname, exc)
                 continue
             for doc_id, text, meta in zip(
-                resp["ids"], resp["documents"], resp["metadatas"]
+                resp["ids"], resp["documents"] or [], resp["metadatas"] or []
             ):
                 results.append((doc_id, text, meta, 2.0))
         return results
 
-    def _phrase_search(
-        self, query: str
-    ) -> list[tuple[str, str, dict, float]]:
+    def _phrase_search(self, query: str) -> list[tuple[str, str, dict, float]]:
         """Fetch chunks containing proper-noun phrases found in the query.
 
         Detects sequences of 2+ consecutive title-case words (e.g. person names,
@@ -441,7 +451,7 @@ class HybridRetriever:
                 logger.debug("Phrase lookup failed for %r: %s", phrase, exc)
                 continue
             for doc_id, text, meta in zip(
-                resp["ids"], resp["documents"], resp["metadatas"]
+                resp["ids"], resp["documents"] or [], resp["metadatas"] or []
             ):
                 if doc_id not in seen:
                     seen.add(doc_id)

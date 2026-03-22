@@ -24,77 +24,119 @@ st.set_page_config(
 
 with st.sidebar:
     st.header("Ingestion Controls")
-    source_dir = st.text_input("Source directory", value="data/")
+
+    source_type = st.radio(
+        "Ingestion source",
+        ["Local Filesystem", "Azure Blob Storage"],
+        horizontal=True,
+    )
+
+    if source_type == "Local Filesystem":
+        source_dir = st.text_input("Source directory", value="data/")
+        azure_conn_str = ""
+        azure_container = ""
+    else:
+        source_dir = "data/"
+        azure_conn_str = st.text_input(
+            "Connection string",
+            type="password",
+            placeholder=(
+                "DefaultEndpointsProtocol=https;AccountName=...;"
+                "AccountKey=...;EndpointSuffix=core.windows.net"
+            ),
+        )
+        azure_container = st.text_input(
+            "Container name",
+            placeholder="my-documents-container",
+        )
 
     if st.button("Sync Documents", type="primary"):
-        status_text = st.empty()
-        progress_bar = st.empty()
-        try:
-            # Kick off background job
-            resp = requests.post(
-                f"{API_BASE}/sync",
-                json={"source_dir": source_dir},
-                timeout=30,
+        if source_type == "Azure Blob Storage" and (
+            not azure_conn_str or not azure_container
+        ):
+            st.error(
+                "Connection string and container name are required "
+                "for Azure ingestion."
             )
-            resp.raise_for_status()
-            job = resp.json()
-            job_id = job["job_id"]
+        else:
+            status_text = st.empty()
+            progress_bar = st.empty()
+            try:
+                # Build payload — include Azure fields when relevant
+                payload: dict = {
+                    "source_dir": source_dir,
+                    "ingestion_source": (
+                        "AZURE" if source_type == "Azure Blob Storage" else "LOCAL"
+                    ),
+                }
+                if source_type == "Azure Blob Storage":
+                    payload["azure_storage_connection_string"] = azure_conn_str
+                    payload["azure_container_name"] = azure_container
 
-            # Poll until complete
-            while True:
-                time.sleep(3)
-                poll = requests.get(
-                    f"{API_BASE}/sync/{job_id}", timeout=120,
+                # Kick off background job
+                resp = requests.post(
+                    f"{API_BASE}/sync",
+                    json=payload,
+                    timeout=30,
                 )
-                poll.raise_for_status()
-                data = poll.json()
+                resp.raise_for_status()
+                job = resp.json()
+                job_id = job["job_id"]
 
-                # Show live progress while running
-                s = data.get("stats")
-                if s and data["status"] == "running":
-                    done = s.get("processed", 0) + s.get("failed", 0)
-                    total = s.get("files_total", 0)
-                    phase = s.get("phase", "")
-                    cur = s.get("current_file", "")
+                # Poll until complete
+                while True:
+                    time.sleep(3)
+                    poll = requests.get(
+                        f"{API_BASE}/sync/{job_id}",
+                        timeout=120,
+                    )
+                    poll.raise_for_status()
+                    data = poll.json()
+
+                    # Show live progress while running
+                    s = data.get("stats")
+                    if s and data["status"] == "running":
+                        done = s.get("processed", 0) + s.get("failed", 0)
+                        total = s.get("files_total", 0)
+                        phase = s.get("phase", "")
+                        cur = s.get("current_file", "")
+                        if total > 0:
+                            progress_bar.progress(
+                                min(done / total, 1.0),
+                                text=f"{done}/{total} files",
+                            )
+                        status_text.text(f"Phase: {phase} | Processing: {cur}")
+
+                    if not data["status"].startswith("running"):
+                        break
+
+                status_text.empty()
+                progress_bar.empty()
+
+                if data["status"] != "completed":
+                    st.error(f"Sync failed: {data['status']}")
+                else:
+                    stats = data["stats"]
+                    st.success("Sync complete")
+
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Processed", stats["processed"])
+                    col2.metric("Skipped", stats["skipped_unchanged"])
+                    col3.metric("Failed", stats["failed"])
+
+                    st.metric("Total Chunks", stats["total_chunks"])
+
+                    total = stats["total_discovered"]
                     if total > 0:
-                        progress_bar.progress(
+                        done = stats["processed"] + stats["skipped_unchanged"]
+                        st.progress(
                             min(done / total, 1.0),
-                            text=f"{done}/{total} files",
+                            text=f"{done}/{total} files complete",
                         )
-                    status_text.text(
-                        f"Phase: {phase} | Processing: {cur}"
-                    )
-
-                if not data["status"].startswith("running"):
-                    break
-
-            status_text.empty()
-            progress_bar.empty()
-
-            if data["status"] != "completed":
-                st.error(f"Sync failed: {data['status']}")
-            else:
-                stats = data["stats"]
-                st.success("Sync complete")
-
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Processed", stats["processed"])
-                col2.metric("Skipped", stats["skipped_unchanged"])
-                col3.metric("Failed", stats["failed"])
-
-                st.metric("Total Chunks", stats["total_chunks"])
-
-                total = stats["total_discovered"]
-                if total > 0:
-                    done = stats["processed"] + stats["skipped_unchanged"]
-                    st.progress(
-                        min(done / total, 1.0),
-                        text=f"{done}/{total} files complete",
-                    )
-        except requests.ConnectionError:
-            st.error("Cannot connect to API server. " "Is it running on port 8000?")
-        except Exception as e:
-            st.error(f"Sync failed: {e}")
+            except requests.ConnectionError:
+                st.error("Cannot connect to API server. " "Is it running on port 8000?")
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
 
     st.divider()
 

@@ -34,6 +34,9 @@ streamlit>=1.35                        # Researcher Dashboard
 ragas>=0.1
 datasets>=2.18
 
+# ── Azure Blob Storage (optional — only needed when INGESTION_SOURCE=AZURE) ────
+azure-storage-blob>=12.0
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0
 tenacity>=8.0

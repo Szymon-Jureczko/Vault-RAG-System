@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import gc
 import logging
+import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -76,13 +78,13 @@ class BatchCommitter:
 
     def __init__(
         self,
-        collection,
-        embedding_fn,
+        collection: Any,
+        embedding_fn: Callable[[list[str]], list[list[float]]],
         batch_size: int = 32,
         gc_interval: int = 500,
     ) -> None:
         self._collection = collection
-        self._embed = embedding_fn
+        self._embed: Callable[[list[str]], list[list[float]]] | None = embedding_fn
         self._batch_size = batch_size
         self._gc_interval = gc_interval
         self._buffer: list[dict] = []
@@ -132,6 +134,7 @@ class BatchCommitter:
         ids = [c["id"] for c in self._buffer]
         texts = [c["text"] for c in self._buffer]
         metas = [c["metadata"] for c in self._buffer]
+        assert self._embed is not None, "embed function unloaded before flush"
         embeddings = self._embed(texts)
 
         self._collection.add(
@@ -199,6 +202,102 @@ def discover_files(directory: Path) -> list[Path]:
     return sorted(set(files))
 
 
+def download_azure_blobs(
+    dest: Path,
+    connection_string: str = "",
+    container_name: str = "",
+) -> int:
+    """Download supported blobs from the configured Azure container to a local dir.
+
+    Uses *connection_string* and *container_name* when supplied; falls back to
+    ``settings.azure_storage_connection_string`` / ``settings.azure_container_name``
+    when not provided.  Only blobs whose file-extension suffix is in
+    ``SUPPORTED_EXTENSIONS`` are downloaded; others are silently skipped.
+    Virtual-directory structure encoded in blob names (e.g.
+    ``"reports/q1/summary.pdf"``) is preserved under *dest*.
+
+    Individual blob download failures are logged as warnings and skipped;
+    the function continues with remaining blobs and returns the count of
+    those that succeeded.
+
+    Args:
+        dest: Local directory to write blobs into.  Must already exist.
+        connection_string: Azure storage connection string.  Falls back to
+            ``settings.azure_storage_connection_string`` when empty.
+        container_name: Azure blob container name.  Falls back to
+            ``settings.azure_container_name`` when empty.
+
+    Returns:
+        Number of blobs successfully downloaded.
+
+    Raises:
+        ImportError: If ``azure-storage-blob`` is not installed.
+        RuntimeError: If the service client cannot be created or the
+            container cannot be listed (connectivity, auth, or not found).
+    """
+    connection_string = connection_string or settings.azure_storage_connection_string
+    container_name = container_name or settings.azure_container_name
+
+    try:
+        from azure.storage.blob import BlobServiceClient  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "azure-storage-blob is required for Azure ingestion. "
+            "Install it with: pip install 'azure-storage-blob>=12.0'"
+        ) from exc
+
+    logger.info("Connecting to Azure container '%s'", container_name)
+    try:
+        service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = service_client.get_container_client(container_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to initialise Azure Blob Storage client: {exc}"
+        ) from exc
+
+    try:
+        blob_list = list(container_client.list_blobs())
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to list blobs in container '{container_name}': {exc}"
+        ) from exc
+
+    logger.info(
+        "Found %d blobs in container '%s'; filtering by supported extensions",
+        len(blob_list),
+        container_name,
+    )
+
+    downloaded = 0
+    for blob in blob_list:
+        if Path(blob.name).suffix.lower() not in SUPPORTED_EXTENSIONS:
+            logger.debug("Skipping unsupported blob: %s", blob.name)
+            continue
+
+        local_path = dest / blob.name
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            blob_client = container_client.get_blob_client(blob.name)
+            with local_path.open("wb") as fh:
+                blob_client.download_blob().readinto(fh)
+            downloaded += 1
+            logger.debug("Downloaded blob: %s -> %s", blob.name, local_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to download blob '%s': %s — skipping", blob.name, exc
+            )
+            local_path.unlink(missing_ok=True)
+
+    logger.info(
+        "Downloaded %d/%d blobs from '%s'",
+        downloaded,
+        len(blob_list),
+        settings.azure_container_name,
+    )
+    return downloaded
+
+
 class IngestionPipeline:
     """Orchestrates document discovery, parsing, and vector storage.
 
@@ -237,8 +336,6 @@ class IngestionPipeline:
         Returns:
             Tuple of (collection, embedding_fn).
         """
-        # Limit ONNX Runtime threads to avoid oversubscribing CPU
-        # and reduce memory pressure when OCR models load later.
         import os
 
         import chromadb
@@ -255,7 +352,7 @@ class IngestionPipeline:
         # Try ONNX backend first for faster CPU inference
         try:
             import numpy as np
-            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from optimum.onnxruntime import ORTModelForFeatureExtraction  # type: ignore
             from transformers import AutoTokenizer
 
             _hub_id = f"sentence-transformers/{settings.embedding_model}"
@@ -318,7 +415,7 @@ class IngestionPipeline:
 
         try:
             import numpy as np
-            from optimum.onnxruntime import ORTModelForFeatureExtraction
+            from optimum.onnxruntime import ORTModelForFeatureExtraction  # type: ignore
             from transformers import AutoTokenizer
 
             _hub_id = f"sentence-transformers/{settings.embedding_model}"
@@ -369,7 +466,7 @@ class IngestionPipeline:
         self,
         files: list[Path],
         workers: int,
-        batcher: "BatchCommitter",
+        batcher: BatchCommitter,
         stats: IngestionStats,
         on_progress: Callable[[IngestionStats], None] | None = None,
         ocr_mode: bool = False,
@@ -409,62 +506,67 @@ class IngestionPipeline:
 
         actual_workers = min(workers, len(files))
         with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-            futures = {
-                executor.submit(_worker, str(fp), self._chunk_size): fp for fp in files
-            }
-            for future in as_completed(futures):
-                fp = futures[future]
-                stats.current_file = fp.name
-                try:
-                    result = future.result(timeout=300)
-                except TimeoutError:
-                    logger.error("Worker timed out for %s", fp)
-                    self._tracker.mark_failed(str(fp), error="Parser timed out (>300s)")
-                    stats.failed += 1
-                    if on_progress:
-                        on_progress(stats)
-                    continue
-                except Exception as exc:
-                    logger.error("Worker error for %s: %s", fp, exc)
-                    self._tracker.mark_failed(str(fp), error=str(exc))
-                    stats.failed += 1
-                    if on_progress:
-                        on_progress(stats)
-                    continue
+            for i in range(0, len(files), actual_workers):
+                batch_files = files[i : i + actual_workers]
+                futures = {
+                    executor.submit(_worker, str(fp), self._chunk_size): fp
+                    for fp in batch_files
+                }
+                for future in as_completed(futures):
+                    fp = futures[future]
+                    stats.current_file = fp.name
+                    try:
+                        result = future.result(timeout=300)
+                    except TimeoutError:
+                        logger.error("Worker timed out for %s", fp)
+                        self._tracker.mark_failed(
+                            str(fp), error="Parser timed out (>300s)"
+                        )
+                        stats.failed += 1
+                        if on_progress:
+                            on_progress(stats)
+                        continue
+                    except Exception as exc:
+                        logger.error("Worker error for %s: %s", fp, exc)
+                        self._tracker.mark_failed(str(fp), error=str(exc))
+                        stats.failed += 1
+                        if on_progress:
+                            on_progress(stats)
+                        continue
 
-                if result.success and result.chunks:
-                    batcher.delete_for_file(fp.name)
-                    if ocr_mode:
-                        for chunk in result.chunks:
-                            pending_chunks.append(
-                                (chunk.chunk_id, chunk.text, chunk.metadata)
-                            )
+                    if result.success and result.chunks:
+                        batcher.delete_for_file(fp.name)
+                        if ocr_mode:
+                            for chunk in result.chunks:
+                                pending_chunks.append(
+                                    (chunk.chunk_id, chunk.text, chunk.metadata)
+                                )
+                        else:
+                            for chunk in result.chunks:
+                                batcher.add(
+                                    chunk.chunk_id,
+                                    chunk.text,
+                                    chunk.metadata,
+                                )
+                        self._tracker.mark_completed(
+                            str(fp), vector_id=result.chunks[0].chunk_id
+                        )
+                        stats.processed += 1
+                        stats.total_chunks += len(result.chunks)
+                    elif result.success:
+                        # Gated/skipped file (e.g. tiny image) — no
+                        # chunks produced but not an error.
+                        self._tracker.mark_completed(str(fp))
+                        stats.skipped_unchanged += 1
                     else:
-                        for chunk in result.chunks:
-                            batcher.add(
-                                chunk.chunk_id,
-                                chunk.text,
-                                chunk.metadata,
-                            )
-                    self._tracker.mark_completed(
-                        str(fp), vector_id=result.chunks[0].chunk_id
-                    )
-                    stats.processed += 1
-                    stats.total_chunks += len(result.chunks)
-                elif result.success:
-                    # Gated/skipped file (e.g. tiny image) — no
-                    # chunks produced but not an error.
-                    self._tracker.mark_completed(str(fp))
-                    stats.skipped_unchanged += 1
-                else:
-                    self._tracker.mark_failed(
-                        str(fp), error=result.error or "Unknown error"
-                    )
-                    stats.failed += 1
+                        self._tracker.mark_failed(
+                            str(fp), error=result.error or "Unknown error"
+                        )
+                        stats.failed += 1
 
-                if on_progress:
-                    on_progress(stats)
-                time.sleep(0)  # yield GIL so API can serve requests
+                    if on_progress:
+                        on_progress(stats)
+                    time.sleep(0)  # yield GIL so API can serve requests
 
         if not ocr_mode:
             batcher.flush()
@@ -475,6 +577,10 @@ class IngestionPipeline:
         self,
         source_dir: Path,
         on_progress: Callable[[IngestionStats], None] | None = None,
+        *,
+        ingestion_source: str = "",
+        azure_connection_string: str = "",
+        azure_container_name: str = "",
     ) -> IngestionStats:
         """Execute the two-phase ingestion pipeline.
 
@@ -487,153 +593,207 @@ class IngestionPipeline:
         PDFs are identified up-front via a cheap text-density probe
         (~5-20 ms each) so they never block the fast worker pool.
 
+        When ``settings.ingestion_source`` is ``'AZURE'``, all blobs from
+        the configured container are downloaded to a temporary local
+        directory before discovery begins.  The temporary directory is
+        removed when the run completes, even if an error is raised.  In
+        AZURE mode *source_dir* is ignored.
+
         Args:
-            source_dir: Directory containing documents to ingest.
+            source_dir: Directory containing documents to ingest (LOCAL
+                mode).  Ignored when ``INGESTION_SOURCE=AZURE``.
+            on_progress: Optional callback invoked after each file is
+                processed, receiving the current :class:`IngestionStats`.
 
         Returns:
             IngestionStats summarising the run.
+
+        Raises:
+            ValueError: If ``INGESTION_SOURCE=AZURE`` but
+                ``AZURE_STORAGE_CONNECTION_STRING`` or
+                ``AZURE_CONTAINER_NAME`` are not configured.
+            RuntimeError: If the Azure container cannot be reached.
         """
         stats = IngestionStats()
+        _tmp_dir: tempfile.TemporaryDirectory | None = None
+        effective_dir = source_dir
 
-        # ── Discover ────────────────────────────────────────────────────
-        all_files = discover_files(source_dir)
-        stats.total_discovered = len(all_files)
-        logger.info("Discovered %d files in %s", len(all_files), source_dir)
-
-        # ── Purge stale records for deleted files ──────────────────────
-        known_paths = {str(fp) for fp in all_files}
-        stale_paths = self._tracker.purge_deleted(known_paths)
-
-        # ── Filter unchanged ────────────────────────────────────────────
-        to_process: list[Path] = []
-        for fp in all_files:
-            if self._tracker.needs_processing(fp):
-                to_process.append(fp)
-            else:
-                stats.skipped_unchanged += 1
-
-        logger.info(
-            "%d to process, %d skipped",
-            len(to_process),
-            stats.skipped_unchanged,
+        # Resolve ingestion source — explicit params take priority over settings
+        eff_source = (ingestion_source or settings.ingestion_source).upper()
+        eff_conn_str = (
+            azure_connection_string or settings.azure_storage_connection_string
         )
-        if not to_process and not stale_paths:
+        eff_container = azure_container_name or settings.azure_container_name
+
+        try:
+            # ── Azure source: validate config, download blobs to temp dir ─────
+            if eff_source == "AZURE":
+                if not eff_conn_str:
+                    raise ValueError(
+                        "AZURE_STORAGE_CONNECTION_STRING must be set "
+                        "when INGESTION_SOURCE=AZURE"
+                    )
+                if not eff_container:
+                    raise ValueError(
+                        "AZURE_CONTAINER_NAME must be set when INGESTION_SOURCE=AZURE"
+                    )
+                _tmp_dir = tempfile.TemporaryDirectory(prefix="rag_azure_")
+                effective_dir = Path(_tmp_dir.name)
+                download_azure_blobs(
+                    effective_dir,
+                    connection_string=eff_conn_str,
+                    container_name=eff_container,
+                )
+
+            # ── Discover ──────────────────────────────────────────────────────
+            all_files = discover_files(effective_dir)
+            stats.total_discovered = len(all_files)
+            logger.info("Discovered %d files in %s", len(all_files), effective_dir)
+
+            # ── Purge stale records for deleted files ──────────────────────────
+            known_paths = {str(fp) for fp in all_files}
+            stale_paths = self._tracker.purge_deleted(known_paths)
+
+            # ── Filter unchanged ───────────────────────────────────────────────
+            to_process: list[Path] = []
+            for fp in all_files:
+                if self._tracker.needs_processing(fp):
+                    to_process.append(fp)
+                else:
+                    stats.skipped_unchanged += 1
+
+            logger.info(
+                "%d to process, %d skipped",
+                len(to_process),
+                stats.skipped_unchanged,
+            )
+            if not to_process and not stale_paths:
+                return stats
+
+            # ── Split into fast vs OCR file lists ──────────────────────────────
+            # Images always go to Phase 2 (OCR).
+            # PDFs are probed: scanned PDFs go to Phase 2, text PDFs to Phase 1.
+            fast_files: list[Path] = []
+            ocr_files: list[Path] = []
+            for fp in to_process:
+                ext = fp.suffix.lower()
+                if ext in IMAGE_EXTENSIONS:
+                    ocr_files.append(fp)
+                elif ext in PDF_EXTENSIONS and is_scanned_pdf(fp):
+                    ocr_files.append(fp)
+                else:
+                    fast_files.append(fp)
+
+            # ── Shared batcher (initialised once, used across both phases) ─────
+            collection, embed_fn = self._init_chroma()
+            batcher = BatchCommitter(
+                collection,
+                embed_fn,
+                batch_size=self._batch_size,
+                gc_interval=settings.batch_commit_size,
+            )
+
+            # ── Clean up ChromaDB chunks for deleted files ─────────────────────
+            for sp in stale_paths:
+                batcher.delete_for_file(Path(sp).name)
+            if stale_paths:
+                logger.info(
+                    "Purged ChromaDB chunks for %d deleted files",
+                    len(stale_paths),
+                )
+
+            # ── Phase 1: fast formats ──────────────────────────────────────────
+            stats.files_total = len(fast_files) + len(ocr_files)
+            stats.phase = "fast"
+            logger.info(
+                "Phase 1 start: %d fast files with %d workers",
+                len(fast_files),
+                self._max_workers,
+            )
+            self._run_phase(
+                fast_files,
+                self._max_workers,
+                batcher,
+                stats,
+                on_progress,
+            )
+
+            # ── Phase 2: OCR / image files (mini-batches to cap memory) ────────
+            _OCR_BATCH = 10
+            if ocr_files:
+                # Flush remaining Phase 1 chunks then unload the embedding
+                # model (~300 MB) so RapidOCR's ONNX models (~400 MB) can
+                # fit in memory alongside ChromaDB.
+                batcher.flush()
+                batcher._embed = None
+                del embed_fn
+                gc.collect()
+                logger.info("Embedding model unloaded to free memory for OCR")
+
+                stats.phase = "ocr"
+                logger.info(
+                    "Phase 2 start: %d OCR files with %d workers (batches of %d)",
+                    len(ocr_files),
+                    self._ocr_workers,
+                    _OCR_BATCH,
+                )
+
+                for batch_start in range(0, len(ocr_files), _OCR_BATCH):
+                    batch = ocr_files[batch_start : batch_start + _OCR_BATCH]
+                    logger.info(
+                        "OCR batch %d–%d of %d",
+                        batch_start + 1,
+                        batch_start + len(batch),
+                        len(ocr_files),
+                    )
+
+                    # Parse this batch (no embedding)
+                    pending = self._run_phase(
+                        batch,
+                        self._ocr_workers,
+                        batcher,
+                        stats,
+                        on_progress,
+                        ocr_mode=True,
+                    )
+
+                    # Free RapidOCR models before loading embedder
+                    from ingestion.parser import RapidOCRParser
+
+                    RapidOCRParser._engine = None
+                    gc.collect()
+
+                    # Reload embedding model (reuses existing collection)
+                    batch_embed_fn = self._init_embed_fn()
+                    batcher._embed = batch_embed_fn
+
+                    if pending:
+                        logger.info("Embedding %d OCR chunks", len(pending))
+                        for chunk_id, text, metadata in pending:
+                            batcher.add(chunk_id, text, metadata)
+                        batcher.flush()
+
+                    # Unload embedding model for next OCR batch
+                    batcher._embed = None
+                    del batch_embed_fn
+                    gc.collect()
+
+            stats.current_file = ""
+            stats.phase = "done"
+            batcher.finalize()
+
+            logger.info(
+                "Pipeline complete: %d processed, %d failed, %d chunks",
+                stats.processed,
+                stats.failed,
+                stats.total_chunks,
+            )
             return stats
 
-        # ── Split into fast vs OCR file lists ───────────────────────────
-        # Images always go to Phase 2 (OCR).
-        # PDFs are probed: scanned PDFs go to Phase 2, text PDFs to Phase 1.
-        fast_files: list[Path] = []
-        ocr_files: list[Path] = []
-        for fp in to_process:
-            ext = fp.suffix.lower()
-            if ext in IMAGE_EXTENSIONS:
-                ocr_files.append(fp)
-            elif ext in PDF_EXTENSIONS and is_scanned_pdf(fp):
-                ocr_files.append(fp)
-            else:
-                fast_files.append(fp)
-
-        # ── Shared batcher (initialised once, used across both phases) ──
-        collection, embed_fn = self._init_chroma()
-        batcher = BatchCommitter(collection, embed_fn, batch_size=self._batch_size)
-
-        # ── Clean up ChromaDB chunks for deleted files ─────────────────
-        for sp in stale_paths:
-            batcher.delete_for_file(Path(sp).name)
-        if stale_paths:
-            logger.info(
-                "Purged ChromaDB chunks for %d deleted files",
-                len(stale_paths),
-            )
-
-        # ── Phase 1: fast formats ────────────────────────────────────────
-        stats.files_total = len(fast_files) + len(ocr_files)
-        stats.phase = "fast"
-        logger.info(
-            "Phase 1 start: %d fast files with %d workers",
-            len(fast_files),
-            self._max_workers,
-        )
-        self._run_phase(
-            fast_files,
-            self._max_workers,
-            batcher,
-            stats,
-            on_progress,
-        )
-
-        # ── Phase 2: OCR / image files (mini-batches to cap memory) ──
-        _OCR_BATCH = 10
-        if ocr_files:
-            # Flush remaining Phase 1 chunks then unload the embedding
-            # model (~300 MB) so RapidOCR's ONNX models (~400 MB) can
-            # fit in memory alongside ChromaDB.
-            batcher.flush()
-            batcher._embed = None
-            del embed_fn
-            gc.collect()
-            logger.info("Embedding model unloaded to free memory for OCR")
-
-            stats.phase = "ocr"
-            logger.info(
-                "Phase 2 start: %d OCR files with %d workers " "(batches of %d)",
-                len(ocr_files),
-                self._ocr_workers,
-                _OCR_BATCH,
-            )
-
-            for batch_start in range(0, len(ocr_files), _OCR_BATCH):
-                batch = ocr_files[batch_start : batch_start + _OCR_BATCH]
-                logger.info(
-                    "OCR batch %d–%d of %d",
-                    batch_start + 1,
-                    batch_start + len(batch),
-                    len(ocr_files),
-                )
-
-                # Parse this batch (no embedding)
-                pending = self._run_phase(
-                    batch,
-                    self._ocr_workers,
-                    batcher,
-                    stats,
-                    on_progress,
-                    ocr_mode=True,
-                )
-
-                # Free RapidOCR models before loading embedder
-                from ingestion.parser import RapidOCRParser
-
-                RapidOCRParser._engine = None
-                gc.collect()
-
-                # Reload embedding model (reuses existing collection)
-                batch_embed_fn = self._init_embed_fn()
-                batcher._embed = batch_embed_fn
-
-                if pending:
-                    logger.info("Embedding %d OCR chunks", len(pending))
-                    for chunk_id, text, metadata in pending:
-                        batcher.add(chunk_id, text, metadata)
-                    batcher.flush()
-
-                # Unload embedding model for next OCR batch
-                batcher._embed = None
-                del batch_embed_fn
-                gc.collect()
-
-        stats.current_file = ""
-        stats.phase = "done"
-        batcher.finalize()
-
-        logger.info(
-            "Pipeline complete: %d processed, %d failed, %d chunks",
-            stats.processed,
-            stats.failed,
-            stats.total_chunks,
-        )
-        return stats
+        finally:
+            if _tmp_dir is not None:
+                _tmp_dir.cleanup()
+                logger.debug("Cleaned up Azure temp dir: %s", _tmp_dir.name)
 
     def close(self) -> None:
         """Release resources held by the pipeline."""
