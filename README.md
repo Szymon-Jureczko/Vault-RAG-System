@@ -20,6 +20,7 @@ Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM.
 ## Features
 
 - **Multimodal ingestion** — PDF, DOCX, XLSX, EML, images (PNG/JPG/TIFF/BMP), and plain text (TXT, MD, CSV, JSON, XML, HTML)
+- **Azure Blob Storage ingestion** — ingest documents directly from an Azure container; blobs are downloaded, parsed, and indexed with a single API call or dashboard button
 - **Scanned document OCR** — RapidOCR (ONNX Runtime) with fast gating and text-density probing for PDFs
 - **Hybrid retrieval** — BM25 keyword + semantic vector + filename lookup + proper-noun phrase matching, merged via Reciprocal Rank Fusion
 - **Cross-encoder reranking** — ms-marco-MiniLM-L-6-v2 refines top results for precision
@@ -32,7 +33,7 @@ Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM.
 ## Architecture
 
 ```
-Documents on disk (data/)
+Documents on disk (data/)  ─or─  Azure Blob Storage
          |
          v
  ┌─────────────────────────────────────────────────────┐
@@ -89,6 +90,7 @@ Documents on disk (data/)
 | API | FastAPI | Background sync, health checks, query endpoint |
 | Dashboard | Streamlit | Chat interface, citation viewer, ingestion progress |
 | State Tracking | SQLite | MD5 hashing, incremental processing, resume-on-failure |
+| Cloud Storage (optional) | Azure Blob Storage | `azure-storage-blob>=12.0`, on-demand download |
 
 ## Quick Start
 
@@ -135,11 +137,18 @@ Documents on disk (data/)
    curl -X POST http://localhost:8000/sync -H "Content-Type: application/json" -d '{"source_dir": "data/"}'
    ```
 
+   For Azure Blob Storage ingestion:
+   ```bash
+   curl -X POST http://localhost:8000/sync \
+     -H "Content-Type: application/json" \
+     -d '{"ingestion_source": "AZURE", "azure_storage_connection_string": "DefaultEndpointsProtocol=...", "azure_container_name": "my-docs"}'
+   ```
+
 ## API Reference
 
 | Method | Endpoint | Body | Description |
 |--------|----------|------|-------------|
-| `POST` | `/sync` | `{"source_dir": "data/"}` | Trigger incremental document ingestion (background) |
+| `POST` | `/sync` | `{"source_dir": "data/", "ingestion_source": "LOCAL\|AZURE", "azure_storage_connection_string": "...", "azure_container_name": "..."}` | Trigger incremental document ingestion (background) |
 | `GET` | `/sync/{job_id}` | — | Poll sync job progress |
 | `GET` | `/stats` | — | Live ingestion counts from SQLite |
 | `POST` | `/query` | `{"question": "...", "top_k": 10}` | Hybrid search + LLM-generated answer with citations |
@@ -196,7 +205,9 @@ localvaultrag/
 │   ├── test_parser.py          # Parser and chunking tests
 │   ├── test_pipeline.py        # BatchCommitter and file discovery tests
 │   ├── test_state_tracker.py   # SQLite state tracker tests
-│   └── test_retriever.py       # Retriever unit + integration tests
+│   ├── test_retriever.py       # Retriever unit + integration tests
+│   ├── test_generate_answer.py # LLM answer generation tests
+│   └── test_azure_ingestion.py # Azure Blob Storage ingestion tests
 ├── data/                       # Runtime data (gitignored)
 │   ├── chroma/                 # ChromaDB persistent index + BM25 pickle
 │   ├── state.db                # SQLite state database
@@ -207,6 +218,7 @@ localvaultrag/
 │   └── Dockerfile              # Python 3.12 + system deps
 ├── .env.example                # Environment variable template
 ├── pyproject.toml              # Build config, pytest/black/isort settings
+├── pyrightconfig.json          # Pyright/Pylance type-checking configuration
 └── requirements.txt            # Python dependencies
 ```
 
@@ -249,8 +261,17 @@ All settings are managed via environment variables (see [`.env.example`](.env.ex
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformer model |
 | `CHROMA_PERSIST_PATH` | `data/chroma` | ChromaDB storage directory |
 | `STATE_DB_PATH` | `data/state.db` | SQLite state database path |
-| `MAX_WORKERS` | `8` | Parallel workers for fast-format parsing |
+| `MAX_WORKERS` | `4` | Parallel workers for fast-format parsing |
 | `APP_ENV` | `development` | Application environment |
+| `INGESTION_SOURCE` | `LOCAL` | Document source: `LOCAL` or `AZURE` |
+| `AZURE_STORAGE_CONNECTION_STRING` | `""` | Azure storage account connection string |
+| `AZURE_CONTAINER_NAME` | `""` | Azure blob container name |
+| `AZURE_STAGING_PATH` | `data/azure_staging` | Local cache directory for Azure blobs |
+| `LLM_NUM_CTX` | `4096` | Ollama context window (tokens) |
+| `LLM_NUM_PREDICT` | `512` | Max tokens per LLM response |
+| `LLM_TIMEOUT` | `120.0` | Ollama HTTP timeout (seconds) |
+| `LLM_TEMPERATURE` | `0.0` | Sampling temperature (0.0 = greedy) |
+| `LLM_NUM_THREAD` | `8` | CPU threads for Ollama inference |
 
 ## Testing
 
@@ -260,14 +281,16 @@ Run the full test suite:
 pytest
 ```
 
-66 tests cover parsing, chunking, pipeline orchestration, state tracking, and retrieval (unit + integration):
+95 tests cover parsing, chunking, pipeline orchestration, state tracking, retrieval, answer generation, and Azure ingestion (unit + integration):
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| `test_parser.py` | 12 | Text splitting, TextParser, parse_file dispatcher |
-| `test_pipeline.py` | 7 | BatchCommitter batching, file discovery, IngestionStats |
-| `test_state_tracker.py` | 16 | MD5 hashing, DB init, CRUD, resume logic, summaries |
 | `test_retriever.py` | 31 | Pydantic models, RRF, BM25 tokenizer, regex patterns, integration |
+| `test_azure_ingestion.py` | 19 | Azure settings, blob download, pipeline Azure dispatch |
+| `test_state_tracker.py` | 17 | MD5 hashing, DB init, CRUD, resume logic, summaries |
+| `test_parser.py` | 13 | Text splitting, TextParser, parse_file dispatcher |
+| `test_generate_answer.py` | 8 | Prompt construction, LLM settings passthrough, score filtering |
+| `test_pipeline.py` | 7 | BatchCommitter batching, file discovery, IngestionStats |
 
 > **Note:** Integration tests in `test_retriever.py` require a populated ChromaDB at `data/chroma/`.
 
