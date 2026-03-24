@@ -42,10 +42,10 @@ class Settings(BaseSettings):
         azure_staging_path: Persistent local directory where blobs are cached
             between Azure syncs.  Using a stable path (instead of a new temp
             dir each run) lets the state tracker skip unchanged files by MD5.
-        llm_num_ctx: Ollama context window in tokens.  4096 provides
-            headroom for 3 chunks of dense non-English content (3 × 2 020-char
-            Polish chunks ÷ 3 chars/token ≈ 2 020 input tokens + prompt
-            overhead, well within 4 096).
+        llm_num_ctx: Ollama context window in tokens.  6144 provides
+            headroom for 5 chunks of dense non-English content (5 × 2 020-char
+            Polish chunks ÷ 3 chars/token ≈ 3 367 input tokens + prompt
+            overhead and 512 generated tokens, well within 6 144).
         llm_num_predict: Maximum tokens Ollama will generate per response.
             512 allows complete enumeration of long bibliographies and lists.
             With 3 LLM chunks, total time is ~75 s (prompt eval ~49 s +
@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     ollama_model_eval: str = "llama3.2:8b"
 
     # ── Embeddings ──────────────────────────────────────────────────────────
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "paraphrase-multilingual-MiniLM-L12-v2"
 
     # ── ChromaDB ────────────────────────────────────────────────────────────
     chroma_persist_path: Path = Path("data/chroma")
@@ -84,11 +84,11 @@ class Settings(BaseSettings):
     state_db_path: Path = Path("data/state.db")
 
     # ── Concurrency ─────────────────────────────────────────────────────────
-    max_workers: int = 4  # non-OCR parsers (leave cores for API + embeddings)
+    max_workers: int = 2  # non-OCR parsers; reduced to leave RAM for larger multilingual embedder
     ocr_workers: int = 1  # OCR/image parsers — sequential is safer on 16 GB
 
     # ── Batch / OOM-safety ──────────────────────────────────────────────────
-    batch_commit_size: int = 100
+    batch_commit_size: int = 50
 
     # ── Chunking ─────────────────────────────────────────────────────────────
     chunk_overlap: int = 400
@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     azure_staging_path: Path = Path("data/azure_staging")
 
     # ── LLM generation parameters ────────────────────────────────────────────
-    llm_num_ctx: int = 4096
+    llm_num_ctx: int = 6144
     llm_num_predict: int = 512
     llm_timeout: float = 120.0
     llm_temperature: float = 0.0

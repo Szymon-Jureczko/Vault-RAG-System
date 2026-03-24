@@ -25,6 +25,7 @@ import re
 from pathlib import Path
 
 import chromadb
+import numpy as np
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
@@ -76,12 +77,17 @@ class HybridRetriever:
         collection_name: ChromaDB collection name.
     """
 
-    _RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    _RERANKER_MODEL = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     _FILENAME_RE = re.compile(
         r"\b([\w][\w\-]*\.(?:png|jpg|jpeg|pdf|eml|docx|txt|csv))\b",
         re.IGNORECASE,
     )
     _PROPER_NOUN_RE = re.compile(r"\b([A-Z][a-z]+(?:[ \-][A-Z][a-z]+)+)\b")
+
+    # Weight for the cross-encoder signal in the blended final score.
+    # 60 % CE + 40 % RRF prevents the English-only CE model from
+    # overriding strong BM25 keyword matches in non-English queries.
+    _CE_WEIGHT: float = 0.6
 
     def __init__(
         self,
@@ -366,12 +372,26 @@ class HybridRetriever:
         pairs = [[query, text] for _, text, _, _ in candidates]
         ce_scores = self._reranker.predict(pairs)
 
+        # Normalise CE scores to [0, 1] so they can be blended with the
+        # incoming RRF scores without scale mismatch.  The English-only CE
+        # model can otherwise suppress strong BM25/keyword matches for
+        # non-English queries, causing the wrong source to rank first.
+        ce_arr = np.array(ce_scores, dtype=float)
+        ce_min, ce_max = ce_arr.min(), ce_arr.max()
+        ce_norm = (ce_arr - ce_min) / (ce_max - ce_min + 1e-9)
+
+        rrf_arr = np.array([s for _, _, _, s in candidates], dtype=float)
+        rrf_min, rrf_max = rrf_arr.min(), rrf_arr.max()
+        rrf_norm = (rrf_arr - rrf_min) / (rrf_max - rrf_min + 1e-9)
+
+        blended = self._CE_WEIGHT * ce_norm + (1.0 - self._CE_WEIGHT) * rrf_norm
+
         reranked = [
             (
                 candidates[i][0],
                 candidates[i][1],
                 candidates[i][2],
-                float(ce_scores[i]),
+                float(blended[i]),
             )
             for i in range(len(candidates))
         ]
@@ -462,8 +482,8 @@ class HybridRetriever:
         self,
         query_text: str,
         top_k: int = 5,
-        semantic_candidates: int = 50,
-        bm25_candidates: int = 50,
+        semantic_candidates: int = 20,
+        bm25_candidates: int = 20,
     ) -> list[RetrievalResult]:
         """Execute a hybrid search with reranking and citations.
 
