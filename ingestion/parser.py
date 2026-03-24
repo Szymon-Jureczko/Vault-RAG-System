@@ -148,7 +148,9 @@ class BaseParser(ABC):
         """File extensions this parser handles (lowercase, with dot)."""
 
     @abstractmethod
-    def parse(self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 200) -> ParserResult:
+    def parse(
+        self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 200
+    ) -> ParserResult:
         """Parse a document into text chunks.
 
         Args:
@@ -273,8 +275,10 @@ class PyMuPDFParser(BaseParser):
         try:
             all_chunks: list[Chunk] = []
             with fitz.open(str(path)) as doc:
-                for page_num, page in enumerate(doc, start=1):
-                    text = page.get_text()
+                for i in range(len(doc)):
+                    page = doc[i]
+                    page_num = i + 1
+                    text = str(page.get_text())
                     page_chunks = _split_text(
                         text, path, chunk_size, self.name, page=page_num
                     )
@@ -344,7 +348,9 @@ class ScannedPDFParser(BaseParser):
             engine = RapidOCRParser._get_engine()
             all_chunks: list[Chunk] = []
             with fitz.open(str(path)) as doc:
-                for page_num, page in enumerate(doc, start=1):
+                for i in range(len(doc)):
+                    page = doc[i]
+                    page_num = i + 1
                     pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY)
                     gray = (
                         np.frombuffer(
@@ -362,16 +368,17 @@ class ScannedPDFParser(BaseParser):
                         continue
 
                     # Rescale if needed
-                    from PIL import Image
+                    from PIL import Image, ImageOps
 
                     img = Image.fromarray(gray)
                     del gray  # free numpy array
+                    img = ImageOps.autocontrast(img)
                     w, h = img.size
                     if w < 800 or w > 3000:
                         scale = _OCR_TARGET_WIDTH / w
                         img = img.resize(
                             (int(w * scale), int(h * scale)),
-                            Image.LANCZOS,
+                            Image.Resampling.LANCZOS,
                         )
 
                     ocr_arr = np.array(img)
@@ -424,7 +431,7 @@ class RapidOCRParser(BaseParser):
         if cls._engine is None:
             from rapidocr_onnxruntime import RapidOCR
 
-            cls._engine = RapidOCR()
+            cls._engine = RapidOCR(det_limit_side_len=1920)
         return cls._engine
 
     @property
@@ -482,13 +489,19 @@ class RapidOCRParser(BaseParser):
                     success=True,
                 )
 
-            # Preprocessing: greyscale + rescale to optimal OCR width
+            # Preprocessing: greyscale + autocontrast + rescale to optimal OCR width
             gray = image.convert("L")
+            from PIL import ImageOps
+
+            gray = ImageOps.autocontrast(gray)
             del image, gray_arr  # free original image + variance array
             w, h = gray.size
             if w < 800 or w > 3000:
                 scale = _OCR_TARGET_WIDTH / w
-                gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                gray = gray.resize(
+                    (int(w * scale), int(h * scale)),
+                    Image.Resampling.LANCZOS,
+                )
 
             ocr_arr = np.array(gray)
             del gray  # free PIL image before OCR inference
@@ -658,7 +671,7 @@ class EmlParser(BaseParser):
                     continue
                 charset = part.get_content_charset() or "utf-8"
                 payload = part.get_payload(decode=True)
-                if payload:
+                if isinstance(payload, bytes):
                     parts.append(payload.decode(charset, errors="replace"))
 
             full_text = "\n\n".join(parts)
@@ -701,7 +714,7 @@ def is_scanned_pdf(file_path: Path) -> bool:
         import fitz
 
         with fitz.open(str(file_path)) as doc:
-            total_chars = sum(len(page.get_text().strip()) for page in doc)
+            total_chars = sum(len(str(page.get_text()).strip()) for page in doc)
             avg = total_chars / max(len(doc), 1)
         return avg < _PDF_TEXT_THRESHOLD
     except Exception:

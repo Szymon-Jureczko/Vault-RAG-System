@@ -396,8 +396,13 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     # ── Optional LLM answer generation ──────────────────────────────
     answer = ""
     if relevant:
-        # Send top 3 to the LLM to keep prompt eval under ~50 s on CPU.
-        answer = _generate_answer(request.question, relevant[:3])
+        # Only send chunks that score at least 85 % of the top chunk's score.
+        # This drops irrelevant results that happen to rank in the top-3 by
+        # volume (e.g. multiple PDF pages outscoring a single-page OCR image)
+        # and prevents the LLM from hallucinating connections between them.
+        top_score = relevant[0].score
+        llm_chunks = [r for r in relevant[:3] if r.score >= top_score * 0.85]
+        answer = _generate_answer(request.question, llm_chunks or relevant[:1])
 
     return QueryResponse(
         question=request.question,
@@ -426,13 +431,26 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
     )
 
     prompt = (
-        "You are a research assistant. Answer the question based ONLY on "
-        "the provided context. Rules:\n"
-        "- If the context contains a list, enumeration, or bibliography, "
-        "reproduce ALL items from ALL context chunks — never truncate.\n"
-        "- Merge information from multiple chunks of the same document.\n"
-        "- If the context does not contain enough information, say so.\n"
-        "- Cite the source filename and page for each claim.\n\n"
+        "Answer the question based on the context. Use only facts from the "
+        "context. Ignore metadata (dates, page numbers, headers). "
+        "Cite source at the end.\n\n"
+        "Example:\n"
+        "Context:\n"
+        "[Source: slides.png, Page 1]\n"
+        "TCP - Transmission Control Protocol\n"
+        "protokol warstwy transportowej\n"
+        "niezawodne polaczenie\n"
+        "3-way handshake\n"
+        "SYN, SYN-ACK, ACK\n\n"
+        "Question: Co to TCP?\n\n"
+        "Answer:\n"
+        "TCP (Transmission Control Protocol) to protokol warstwy "
+        "transportowej, ktory zapewnia niezawodne polaczenie miedzy "
+        "urzadzeniami. Nawiazanie polaczenia odbywa sie za pomoca "
+        "mechanizmu 3-way handshake, w ktorym wymieniane sa pakiety "
+        "SYN, SYN-ACK i ACK.\n\n"
+        "[slides.png, Page 1]\n\n"
+        "---\n\n"
         f"Context:\n{context}\n\n"
         f"Question: {question}\n\nAnswer:"
     )
