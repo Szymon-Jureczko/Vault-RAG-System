@@ -1,0 +1,13 @@
+.git
+.devcontainer
+.github
+.claude
+__pycache__
+*.pyc
+*.pyo
+data/
+evals/results.json
+.env
+*.egg-info
+.pytest_cache
+.mypy_cache

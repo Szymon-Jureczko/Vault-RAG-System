@@ -10,12 +10,23 @@
 ---
 
 ## Overview
-<img width="1782" height="937" alt="projimg3" src="https://github.com/user-attachments/assets/fa1036cc-d5ed-410e-b90d-44030c68ecf2" />
-<img width="1292" height="732" alt="projimg4" src="https://github.com/user-attachments/assets/a84cef4a-6cda-418c-8fc8-0da2677880d7" />
 
-Vault-RAG-System ingests thousands of messy enterprise documents — PDFs, Word files, spreadsheets, emails, and scanned images — indexes them with a hybrid search engine, and answers natural-language questions with cited sources. Documents can come from local disk or Azure Blob Storage. All LLM inference and vector search run on your machine via Ollama and ChromaDB — no OpenAI keys, no external AI APIs.
 
-Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM.
+Vault-RAG-System ingests enterprise documents at any scale — PDFs, Word files, spreadsheets, emails, and scanned images — indexes them with a hybrid search engine, and answers natural-language questions with cited sources. Documents can come from local disk or Azure Blob Storage. All LLM inference and vector search run on your machine via Ollama and ChromaDB — no OpenAI keys, no external AI APIs.
+
+Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM. There is no hard limit on document count — incremental processing, two-phase model swapping, and batch commits keep memory stable regardless of corpus size. Ingestion scales linearly: more documents means more time, not more memory.
+
+On stronger hardware the pipeline scales up with a few parameter changes:
+
+| Parameter | Default | Scale-up effect |
+|-----------|---------|-----------------|
+| `MAX_WORKERS` | `2` | Increase to match available CPU cores for faster parallel parsing |
+| `OCR_WORKERS` | `1` | Increase when RAM allows simultaneous OCR + embedding |
+| `LLM_NUM_THREAD` | `8` | Match to physical core count for faster LLM inference |
+| `LLM_NUM_CTX` | `6144` | Expand context window for longer, more detailed answers |
+| `LLM_NUM_PREDICT` | `768` | Allow longer LLM responses |
+| `BATCH_COMMIT_SIZE` | `50` | Increase to reduce commit overhead with more RAM |
+| `OLLAMA_MODEL_DEV` | `llama3.2:3b` | Swap to larger models (8b, 70b) for higher answer quality |
 
 ## Features
 
@@ -23,7 +34,7 @@ Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM.
 - **Azure Blob Storage ingestion** — ingest documents directly from an Azure container; blobs are downloaded, parsed, and indexed with a single API call or dashboard button
 - **Scanned document OCR** — RapidOCR (ONNX Runtime) with fast gating and text-density probing for PDFs
 - **Hybrid retrieval** — BM25 keyword + semantic vector + filename lookup + proper-noun phrase matching, merged via Reciprocal Rank Fusion
-- **Cross-encoder reranking** — ms-marco-MiniLM-L-6-v2 refines top results for precision
+- **Cross-encoder reranking** — multilingual mmarco-mMiniLMv2-L12-H384-v1 refines top results for precision
 - **Citations on every result** — filename, page number, and text snippet
 - **Incremental processing** — SQLite state DB with MD5 change detection; never reprocesses unchanged files, resumes from failures
 - **Memory-safe on 16 GB RAM** — two-phase pipeline, model swapping (unload embedder for OCR and vice versa), batch commits, `gc.collect()` checkpoints
@@ -36,20 +47,20 @@ Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM.
 Documents on disk (data/)  ─or─  Azure Blob Storage
          |
          v
- ┌─────────────────────────────────────────────────────┐
- │            Ingestion Pipeline                        │
- │  discover_files ──► StateTracker (SQLite + MD5)      │
- │        |                                             │
- │        ▼                                             │
- │  Phase 1: Fast formats    Phase 2: OCR formats       │
- │  (PDF, DOCX, XLSX, EML)   (scanned PDF, images)     │
- │  N workers in parallel     1 worker, mini-batches    │
- │        |                        |                    │
- │        └──────────┬─────────────┘                    │
- │                   ▼                                  │
- │          BatchCommitter ──► ChromaDB (HNSW cosine)   │
- │          all-MiniLM-L6-v2 embeddings (ONNX)          │
- └─────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────┐
+ │            Ingestion Pipeline                                │
+ │  discover_files ──► StateTracker (SQLite + MD5)              │
+ │        |                                                     │
+ │        ▼                                                     │
+ │  Phase 1: Fast formats    Phase 2: OCR formats               │
+ │  (PDF, DOCX, XLSX, EML)   (scanned PDF, images)             │
+ │  N workers in parallel     1 worker, mini-batches            │
+ │        |                        |                            │
+ │        └──────────┬─────────────┘                            │
+ │                   ▼                                          │
+ │          BatchCommitter ──► ChromaDB (HNSW cosine)           │
+ │    paraphrase-multilingual-MiniLM-L12-v2 embeddings (ONNX)  │
+ └──────────────────────────────────────────────────────────────┘
                      |
                      v
  ┌─────────────────────────────────────────────────────┐
@@ -81,12 +92,12 @@ Documents on disk (data/)  ─or─  Azure Blob Storage
 | Component | Technology | Details |
 |-----------|-----------|---------|
 | LLM | Ollama + Llama 3.2 | 3b (dev) / 8b (eval), local CPU inference |
-| Embeddings | all-MiniLM-L6-v2 | 384-dim, ONNX-accelerated with PyTorch fallback |
+| Embeddings | paraphrase-multilingual-MiniLM-L12-v2 | 384-dim, multilingual, ONNX-accelerated with PyTorch fallback |
 | Vector DB | ChromaDB | HNSW index, cosine similarity, persistent disk mode |
 | OCR | RapidOCR | ONNX Runtime, replaces Tesseract for 3-10x speed |
 | PDF Parsing | PyMuPDF | Native text extraction + 300 DPI rendering for scanned pages |
 | Keyword Search | BM25Okapi | Pickled to disk, auto-refreshed after ingestion |
-| Reranker | cross-encoder/ms-marco-MiniLM-L-6-v2 | Query-document pair scoring |
+| Reranker | cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 | Multilingual query-document pair scoring |
 | API | FastAPI | Background sync, health checks, query endpoint |
 | Dashboard | Streamlit | Chat interface, citation viewer, ingestion progress |
 | State Tracking | SQLite | MD5 hashing, incremental processing, resume-on-failure |
@@ -96,43 +107,69 @@ Documents on disk (data/)  ─or─  Azure Blob Storage
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/)
-- [VS Code](https://code.visualstudio.com/) with the [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension
+- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)
 
-### Setup
+### Option A — Docker Compose (standalone deployment)
 
-1. **Clone the repository:**
+1. **Clone and configure:**
+   ```bash
+   git clone https://github.com/<your-username>/localvaultrag.git
+   cd localvaultrag
+   cp .env.example .env
+   ```
+
+2. **Start all services:**
+   ```bash
+   docker compose up -d
+   ```
+   This builds the app image, starts the API server (`:8000`), Streamlit dashboard (`:8501`), and Ollama sidecar — then pulls the default LLM model automatically.
+
+3. **Pull the LLM model** (first run only):
+   ```bash
+   docker compose exec ollama ollama pull llama3.2:3b
+   ```
+
+4. **Trigger ingestion** — place documents in the `data/` volume, then click Sync in the dashboard at `http://localhost:8501`, or:
+   ```bash
+   curl -X POST http://localhost:8000/sync -H "Content-Type: application/json" -d '{"source_dir": "data/"}'
+   ```
+
+### Option B — VS Code Dev Container (development)
+
+1. Install [VS Code](https://code.visualstudio.com/) with the [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) extension.
+
+2. **Clone the repository:**
    ```bash
    git clone https://github.com/<your-username>/localvaultrag.git
    cd localvaultrag
    ```
 
-2. **Open in Dev Container:**
+3. **Open in Dev Container:**
 
    Open the project in VS Code and select **"Reopen in Container"** when prompted (or run the `Dev Containers: Reopen in Container` command). This builds the Python 3.12 container and starts the Ollama sidecar automatically.
 
-3. **Configure environment:**
+4. **Configure environment:**
    ```bash
    cp .env.example .env
    ```
    The defaults work out of the box — Ollama runs as a sidecar service on the Docker network.
 
-4. **Generate test documents** (optional — creates ~1,000 synthetic documents):
+5. **Generate test documents** (optional — creates ~1,000 synthetic documents):
    ```bash
    python scripts/generate_test_docs.py
    ```
 
-5. **Start the API server:**
+6. **Start the API server:**
    ```bash
    uvicorn api.main:app --host 0.0.0.0 --port 8000
    ```
 
-6. **Start the Streamlit dashboard** (in a second terminal):
+7. **Start the Streamlit dashboard** (in a second terminal):
    ```bash
    streamlit run api/streamlit_app.py --server.port 8888
    ```
 
-7. **Trigger ingestion** — click the Sync button in the dashboard, or:
+8. **Trigger ingestion** — click the Sync button in the dashboard, or:
    ```bash
    curl -X POST http://localhost:8000/sync -H "Content-Type: application/json" -d '{"source_dir": "data/"}'
    ```
@@ -152,6 +189,7 @@ Documents on disk (data/)  ─or─  Azure Blob Storage
 | `GET` | `/sync/{job_id}` | — | Poll sync job progress |
 | `GET` | `/stats` | — | Live ingestion counts from SQLite |
 | `POST` | `/query` | `{"question": "...", "top_k": 10}` | Hybrid search + LLM-generated answer with citations |
+| `POST` | `/query/stream` | `{"question": "...", "top_k": 10}` | Streaming variant — returns citations then LLM tokens via SSE |
 | `GET` | `/health` | — | Health check with document count |
 
 ### Example query
@@ -217,6 +255,9 @@ localvaultrag/
 │   ├── docker-compose.yml      # App (6 GB) + Ollama (8 GB) services
 │   └── Dockerfile              # Python 3.12 + system deps
 ├── .env.example                # Environment variable template
+├── Dockerfile                  # Production container image
+├── docker-compose.yml          # Standalone deployment (app + dashboard + Ollama)
+├── .dockerignore               # Docker build exclusions
 ├── pyproject.toml              # Build config, pytest/black/isort settings
 ├── pyrightconfig.json          # Pyright/Pylance type-checking configuration
 └── requirements.txt            # Python dependencies
@@ -228,7 +269,7 @@ localvaultrag/
 
 The pipeline runs in two phases to stay within 16 GB RAM:
 
-1. **Phase 1 (fast formats):** PDF, DOCX, XLSX, and EML files are parsed in parallel using multiple workers. Each file is chunked (2,000 chars with 200-char overlap), embedded with all-MiniLM-L6-v2, and committed to ChromaDB in batches.
+1. **Phase 1 (fast formats):** PDF, DOCX, XLSX, and EML files are parsed in parallel using multiple workers. Each file is chunked (2,000 chars with 400-char overlap), embedded with paraphrase-multilingual-MiniLM-L12-v2, and committed to ChromaDB in batches.
 
 2. **Phase 2 (OCR formats):** Scanned PDFs and images are processed sequentially with a single worker. The embedding model is unloaded to free ~300 MB before OCR begins, and ORC models (~400 MB) are unloaded before reloading the embedder.
 
@@ -242,7 +283,7 @@ Each query goes through a multi-signal pipeline:
 2. **BM25 keyword search** — lexical matching via BM25Okapi
 3. **Reciprocal Rank Fusion** — merges the two ranked lists (k=60)
 4. **Filename / phrase search** — regex-detects filenames and proper nouns in the query for targeted metadata lookups
-5. **Cross-encoder reranking** — ms-marco-MiniLM-L-6-v2 scores each query-document pair
+5. **Cross-encoder reranking** — mmarco-mMiniLMv2-L12-H384-v1 (multilingual) scores each query-document pair
 6. **Citation assembly** — attaches filename, page number, and text snippet to every result
 
 ### Answer Generation
@@ -258,20 +299,23 @@ All settings are managed via environment variables (see [`.env.example`](.env.ex
 | `OLLAMA_BASE_URL` | `http://ollama:11434` | Ollama API endpoint |
 | `OLLAMA_MODEL_DEV` | `llama3.2:3b` | LLM for development |
 | `OLLAMA_MODEL_EVAL` | `llama3.2:8b` | LLM for evaluation runs |
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Sentence-transformer model |
+| `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformer model (`.env.example` overrides to `all-MiniLM-L6-v2`) |
 | `CHROMA_PERSIST_PATH` | `data/chroma` | ChromaDB storage directory |
 | `STATE_DB_PATH` | `data/state.db` | SQLite state database path |
-| `MAX_WORKERS` | `4` | Parallel workers for fast-format parsing |
+| `MAX_WORKERS` | `2` | Parallel workers for fast-format parsing |
 | `APP_ENV` | `development` | Application environment |
 | `INGESTION_SOURCE` | `LOCAL` | Document source: `LOCAL` or `AZURE` |
 | `AZURE_STORAGE_CONNECTION_STRING` | `""` | Azure storage account connection string |
 | `AZURE_CONTAINER_NAME` | `""` | Azure blob container name |
 | `AZURE_STAGING_PATH` | `data/azure_staging` | Local cache directory for Azure blobs |
-| `LLM_NUM_CTX` | `4096` | Ollama context window (tokens) |
-| `LLM_NUM_PREDICT` | `512` | Max tokens per LLM response |
+| `LLM_NUM_CTX` | `6144` | Ollama context window (tokens) |
+| `LLM_NUM_PREDICT` | `768` | Max tokens per LLM response |
 | `LLM_TIMEOUT` | `120.0` | Ollama HTTP timeout (seconds) |
 | `LLM_TEMPERATURE` | `0.0` | Sampling temperature (0.0 = greedy) |
 | `LLM_NUM_THREAD` | `8` | CPU threads for Ollama inference |
+| `OCR_WORKERS` | `1` | Parallel workers for OCR/image parsing |
+| `BATCH_COMMIT_SIZE` | `50` | Vectors buffered before committing to ChromaDB |
+| `CHUNK_OVERLAP` | `400` | Character overlap between consecutive text chunks |
 
 ## Testing
 

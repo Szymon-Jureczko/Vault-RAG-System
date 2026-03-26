@@ -1,0 +1,54 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - app-data:/app/data
+    environment:
+      - PYTHONPATH=/app
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - CHROMA_PERSIST_PATH=/app/data/chroma
+      - STATE_DB_PATH=/app/data/state.db
+    env_file:
+      - path: .env
+        required: false
+    mem_limit: 6g
+    networks:
+      - ragsystem
+    depends_on:
+      ollama:
+        condition: service_started
+
+  dashboard:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - PYTHONPATH=/app
+    command: ["streamlit", "run", "api/streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+    networks:
+      - ragsystem
+    depends_on:
+      - app
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=30m
+      - OLLAMA_FLASH_ATTENTION=1
+    mem_limit: 8g
+    networks:
+      - ragsystem
+
+volumes:
+  app-data:
+  ollama-models:
+
+networks:
+  ragsystem:
