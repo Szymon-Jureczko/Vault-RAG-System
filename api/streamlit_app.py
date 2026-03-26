@@ -7,6 +7,7 @@ Run with::
 
 from __future__ import annotations
 
+import json
 import time
 
 import requests
@@ -180,62 +181,94 @@ if question := st.chat_input("Ask a question about your documents..."):
     with st.chat_message("user"):
         st.markdown(question)
 
-    # Query API
+    # Query API — streaming
     with st.chat_message("assistant"):
-        with st.spinner("Searching and generating answer..."):
-            try:
-                resp = requests.post(
-                    f"{API_BASE}/query",
-                    json={"question": question, "top_k": 10},
-                    timeout=200,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+        try:
+            # Open SSE stream — citations arrive first, then tokens
+            resp = requests.post(
+                f"{API_BASE}/query/stream",
+                json={"question": question, "top_k": 10},
+                timeout=200,
+                stream=True,
+            )
+            resp.raise_for_status()
 
-                answer = data.get("answer", "No answer generated.")
-                st.markdown(answer)
+            citations = []
+            results_data = []
+            answer_placeholder = st.empty()
+            answer_tokens: list[str] = []
 
-                citations = []
-                if data.get("results"):
-                    with st.expander("Citations & Sources"):
-                        for r in data["results"]:
-                            c = r["citation"]
-                            page_str = f", Page {c['page']}" if c.get("page") else ""
-                            st.markdown(
-                                f"**{c['filename']}**"
-                                f"{page_str} "
-                                f"(score: {r['score']:.3f})"
-                            )
-                            st.text(c["snippet"])
-                            st.divider()
-                            citations.append(c)
+            event_type = ""
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if raw_line is None:
+                    continue
+                line = raw_line
+                if line.startswith("event:"):
+                    event_type = line[len("event:"):].strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
 
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": answer,
-                        "citations": citations,
-                    }
-                )
+                if event_type == "citations":
+                    results_data = json.loads(data_str)
 
-            except requests.ConnectionError:
-                err = (
-                    "Cannot connect to API server. "
-                    "Start it with: `uvicorn api.main:app`"
-                )
-                st.error(err)
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": err,
-                    }
-                )
-            except Exception as e:
-                err = f"Query failed: {e}"
-                st.error(err)
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": err,
-                    }
-                )
+                elif event_type == "token":
+                    token = json.loads(data_str)
+                    answer_tokens.append(token)
+                    answer_placeholder.markdown("".join(answer_tokens))
+
+                elif event_type == "done":
+                    break
+
+            answer = "".join(answer_tokens) or "No answer generated."
+            answer_placeholder.markdown(answer)
+
+            # Show citations below the completed answer
+            if results_data:
+                with st.expander("Citations & Sources"):
+                    for r in results_data:
+                        c = r["citation"]
+                        page_str = (
+                            f", Page {c['page']}"
+                            if c.get("page")
+                            else ""
+                        )
+                        st.markdown(
+                            f"**{c['filename']}**"
+                            f"{page_str} "
+                            f"(score: {r['score']:.3f})"
+                        )
+                        st.text(c["snippet"])
+                        st.divider()
+                        citations.append(c)
+
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "citations": citations,
+                }
+            )
+
+        except requests.ConnectionError:
+            err = (
+                "Cannot connect to API server. "
+                "Start it with: `uvicorn api.main:app`"
+            )
+            st.error(err)
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": err,
+                }
+            )
+        except Exception as e:
+            err = f"Query failed: {e}"
+            st.error(err)
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": err,
+                }
+            )

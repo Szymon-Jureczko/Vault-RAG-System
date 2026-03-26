@@ -34,6 +34,78 @@ from ingestion.config import settings
 
 logger = logging.getLogger(__name__)
 
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _extract_relevant_snippet(
+    text: str, query: str, max_len: int = 500
+) -> str:
+    """Return the most query-relevant window of *text*, up to *max_len* chars.
+
+    Uses a sliding-window approach scored by keyword overlap with the query.
+    Falls back to the first *max_len* characters when no query is provided.
+    The window boundaries are nudged to the nearest sentence-ending
+    punctuation so snippets read more naturally.
+    """
+    # Strip the [Source: ...] prefix that ingestion prepends
+    clean = re.sub(r"^\[Source:[^\]]*\]\s*", "", text)
+    if not clean:
+        return text[:max_len].strip()
+
+    if len(clean) <= max_len:
+        return clean.strip()
+
+    if not query:
+        return clean[:max_len].strip()
+
+    query_words = {w.lower() for w in _WORD_RE.findall(query)}
+    if not query_words:
+        return clean[:max_len].strip()
+
+    # Score each window position by keyword hit count
+    words = _WORD_RE.findall(clean)
+    word_starts: list[int] = []
+    pos = 0
+    for w in words:
+        idx = clean.index(w, pos)
+        word_starts.append(idx)
+        pos = idx + len(w)
+
+    best_start = 0
+    best_score = -1
+    step = max(1, len(words) // 60)  # coarse scan for speed
+
+    for i in range(0, len(words), step):
+        start_char = word_starts[i]
+        end_char = min(start_char + max_len, len(clean))
+        window_words = {
+            w.lower() for w in _WORD_RE.findall(clean[start_char:end_char])
+        }
+        score = len(query_words & window_words)
+        if score > best_score:
+            best_score = score
+            best_start = start_char
+
+    # Snap start to beginning of sentence (look back for '. ' or newline)
+    snap = clean.rfind(". ", max(0, best_start - 80), best_start)
+    if snap != -1:
+        best_start = snap + 2
+    else:
+        snap = clean.rfind("\n", max(0, best_start - 80), best_start)
+        if snap != -1:
+            best_start = snap + 1
+
+    snippet = clean[best_start : best_start + max_len].strip()
+
+    # Trim to last sentence-ending punctuation if possible
+    for end_mark in (". ", ".\n", ".\t"):
+        last = snippet.rfind(end_mark)
+        if last > max_len // 2:
+            snippet = snippet[: last + 1]
+            break
+
+    return snippet
+
 
 class Citation(BaseModel):
     """Source citation for a retrieved chunk.
@@ -41,7 +113,7 @@ class Citation(BaseModel):
     Attributes:
         filename: Name of the source document.
         page: Page number (if available).
-        snippet: First 200 characters of the matched text.
+        snippet: Most relevant ~500 characters of the matched text.
         source_path: Full path to the source file.
     """
 
@@ -399,20 +471,27 @@ class HybridRetriever:
         return reranked[:top_k]
 
     @staticmethod
-    def _build_citation(metadata: dict, text: str) -> Citation:
+    def _build_citation(metadata: dict, text: str, query: str = "") -> Citation:
         """Build a Citation from chunk metadata.
+
+        Selects a ~500-character snippet centred on the region of *text*
+        that has the highest keyword overlap with *query*, so the
+        citation surfaces the most relevant content rather than the
+        first 200 characters.
 
         Args:
             metadata: Chunk metadata dict.
             text: Full chunk text.
+            query: The user's query (used to pick a relevant window).
 
         Returns:
             Citation with filename, page, and snippet.
         """
+        snippet = _extract_relevant_snippet(text, query, max_len=500)
         return Citation(
             filename=metadata.get("filename", "unknown"),
             page=metadata.get("page"),
-            snippet=text[:200].strip(),
+            snippet=snippet,
             source_path=metadata.get("source", ""),
         )
 
@@ -536,7 +615,7 @@ class HybridRetriever:
                     chunk_id=doc_id,
                     text=text,
                     score=score,
-                    citation=self._build_citation(meta, text),
+                    citation=self._build_citation(meta, text, query_text),
                 )
             )
 
