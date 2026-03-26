@@ -135,7 +135,7 @@ class CitationOut(BaseModel):
     Attributes:
         filename: Source document name.
         page: Page number (if available).
-        snippet: First 200 characters of the matched text.
+        snippet: Most relevant ~500 characters of the matched text.
     """
 
     filename: str
