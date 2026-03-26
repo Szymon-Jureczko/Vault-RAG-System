@@ -18,10 +18,11 @@ import re
 import threading
 import uuid as _uuid
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ingestion.config import settings
@@ -411,15 +412,75 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     )
 
 
-def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
-    """Generate an answer using Ollama from retrieved context.
+@app.post("/query/stream")
+def query_documents_stream(request: QueryRequest) -> StreamingResponse:
+    """Stream a RAG response: citations as JSON, then LLM tokens via SSE.
+
+    Emits Server-Sent Events:
+    - ``event: citations`` — JSON array of retrieval results (sent once).
+    - ``event: token``     — a single LLM token in ``data:``.
+    - ``event: done``      — signals end of stream.
+
+    Args:
+        request: QueryRequest with question and top_k.
+
+    Returns:
+        StreamingResponse with ``text/event-stream`` content type.
+    """
+    retriever = _get_retriever()
+    results = retriever.query(request.question, top_k=request.top_k)
+
+    relevant = [r for r in results if r.score > 0] or results[:1]
+
+    result_items = [
+        {
+            "text": r.text,
+            "score": r.score,
+            "citation": {
+                "filename": r.citation.filename,
+                "page": r.citation.page,
+                "snippet": r.citation.snippet,
+            },
+        }
+        for r in relevant
+    ]
+
+    top_score = relevant[0].score if relevant else 0
+    llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
+
+    def event_generator() -> Iterator[str]:
+        # 1. Send citations immediately so the UI can show them
+        yield f"event: citations\ndata: {json.dumps(result_items)}\n\n"
+
+        # 2. Stream LLM tokens
+        for token in _stream_answer(
+            request.question, llm_chunks or relevant[:1]
+        ):
+            escaped = json.dumps(token)
+            yield f"event: token\ndata: {escaped}\n\n"
+
+        # 3. Signal completion
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _build_llm_payload(
+    question: str, results: list[RetrievalResult], *, stream: bool = False
+) -> dict:
+    """Build the Ollama /api/chat JSON payload.
 
     Args:
         question: The user's question.
         results: Retrieved context chunks.
+        stream: Whether to request token-by-token streaming.
 
     Returns:
-        LLM-generated answer string.
+        dict ready for ``httpx.post(..., json=payload)``.
     """
     context = "\n\n---\n\n".join(
         "[Source: {fn}{pg}]\n{txt}".format(
@@ -441,34 +502,47 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
         "the question, say: \"The provided documents do not contain enough "
         "information to answer this question.\"\n"
         "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
-        "4. Cover the definition and the most important details (3-5 "
-        "sentences). Do not repeat yourself or pad the answer.\n"
+        "4. Give a thorough, educational answer. Start with a clear "
+        "definition, then explain key details, categories, applications, "
+        "or examples mentioned in the context. Aim for a comprehensive "
+        "response that covers the most important information available "
+        "in the provided sources. Do not repeat yourself.\n"
         "5. Do NOT add citations or source references — they are handled "
         "separately."
     )
 
-    user_message = (
-        f"Context:\n{context}\n\n"
-        f"Question: {question}"
-    )
+    user_message = f"Context:\n{context}\n\nQuestion: {question}"
 
+    return {
+        "model": settings.ollama_model_dev,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "stream": stream,
+        "options": {
+            "num_ctx": settings.llm_num_ctx,
+            "num_predict": settings.llm_num_predict,
+            "temperature": settings.llm_temperature,
+            "num_thread": settings.llm_num_thread,
+        },
+    }
+
+
+def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
+    """Generate an answer using Ollama from retrieved context.
+
+    Args:
+        question: The user's question.
+        results: Retrieved context chunks.
+
+    Returns:
+        LLM-generated answer string.
+    """
     try:
         response = httpx.post(
             f"{settings.ollama_base_url}/api/chat",
-            json={
-                "model": settings.ollama_model_dev,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                "stream": False,
-                "options": {
-                    "num_ctx": settings.llm_num_ctx,
-                    "num_predict": settings.llm_num_predict,
-                    "temperature": settings.llm_temperature,
-                    "num_thread": settings.llm_num_thread,
-                },
-            },
+            json=_build_llm_payload(question, results, stream=False),
             timeout=settings.llm_timeout,
         )
         response.raise_for_status()
@@ -476,6 +550,39 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
     except Exception as exc:
         logger.warning("LLM generation failed: %s", exc)
         return f"(LLM unavailable: {exc})"
+
+
+def _stream_answer(
+    question: str, results: list[RetrievalResult]
+) -> Iterator[str]:
+    """Stream an LLM answer token-by-token from Ollama.
+
+    Yields:
+        Individual text tokens as they arrive from the model.
+    """
+    try:
+        with httpx.stream(
+            "POST",
+            f"{settings.ollama_base_url}/api/chat",
+            json=_build_llm_payload(question, results, stream=True),
+            timeout=httpx.Timeout(
+                connect=10.0,
+                read=settings.llm_timeout,
+                write=10.0,
+                pool=10.0,
+            ),
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    yield token
+    except Exception as exc:
+        logger.warning("LLM streaming failed: %s", exc)
+        yield f"(LLM unavailable: {exc})"
 
 
 @app.get("/health")
