@@ -470,6 +470,8 @@ class IngestionPipeline:
         stats: IngestionStats,
         on_progress: Callable[[IngestionStats], None] | None = None,
         ocr_mode: bool = False,
+        *,
+        key_map: dict[Path, str] | None = None,
     ) -> list[tuple[str, str, dict]]:
         """Parse, embed, and commit one phase of files with per-file state updates.
 
@@ -490,6 +492,9 @@ class IngestionPipeline:
             on_progress: Optional callback invoked after each file.
             ocr_mode: When True, return parsed chunks instead of
                 embedding them (caller handles embedding).
+            key_map: Optional mapping from absolute file path to the
+                stable state-DB key (source-relative path).  When
+                ``None``, absolute paths are used as keys (LOCAL mode).
 
         Returns:
             In ocr_mode: list of (chunk_id, text, metadata) tuples.
@@ -498,9 +503,12 @@ class IngestionPipeline:
         if not files:
             return []
 
+        def _key(fp: Path) -> str:
+            return key_map[fp] if key_map else str(fp)
+
         for fp in files:
             md5 = compute_md5(fp)
-            self._tracker.mark_in_progress(str(fp), md5)
+            self._tracker.mark_in_progress(_key(fp), md5)
 
         pending_chunks: list[tuple[str, str, dict]] = []
 
@@ -520,7 +528,7 @@ class IngestionPipeline:
                     except TimeoutError:
                         logger.error("Worker timed out for %s", fp)
                         self._tracker.mark_failed(
-                            str(fp), error="Parser timed out (>300s)"
+                            _key(fp), error="Parser timed out (>300s)"
                         )
                         stats.failed += 1
                         if on_progress:
@@ -528,7 +536,7 @@ class IngestionPipeline:
                         continue
                     except Exception as exc:
                         logger.error("Worker error for %s: %s", fp, exc)
-                        self._tracker.mark_failed(str(fp), error=str(exc))
+                        self._tracker.mark_failed(_key(fp), error=str(exc))
                         stats.failed += 1
                         if on_progress:
                             on_progress(stats)
@@ -549,18 +557,18 @@ class IngestionPipeline:
                                     chunk.metadata,
                                 )
                         self._tracker.mark_completed(
-                            str(fp), vector_id=result.chunks[0].chunk_id
+                            _key(fp), vector_id=result.chunks[0].chunk_id
                         )
                         stats.processed += 1
                         stats.total_chunks += len(result.chunks)
                     elif result.success:
                         # Gated/skipped file (e.g. tiny image) — no
                         # chunks produced but not an error.
-                        self._tracker.mark_completed(str(fp))
+                        self._tracker.mark_completed(_key(fp))
                         stats.skipped_unchanged += 1
                     else:
                         self._tracker.mark_failed(
-                            str(fp), error=result.error or "Unknown error"
+                            _key(fp), error=result.error or "Unknown error"
                         )
                         stats.failed += 1
 
@@ -650,14 +658,25 @@ class IngestionPipeline:
             stats.total_discovered = len(all_files)
             logger.info("Discovered %d files in %s", len(all_files), effective_dir)
 
+            # Build a mapping from absolute path → source-prefixed key so
+            # that Azure temp-dir resyncs produce the same state-DB keys
+            # and LOCAL / AZURE records never collide with each other.
+            _src_prefix = f"{eff_source.lower()}:"
+            key_map: dict[Path, str] = {
+                fp: _src_prefix + str(fp.relative_to(effective_dir))
+                for fp in all_files
+            }
+
             # ── Purge stale records for deleted files ──────────────────────────
-            known_paths = {str(fp) for fp in all_files}
-            stale_paths = self._tracker.purge_deleted(known_paths)
+            known_paths = {key_map[fp] for fp in all_files}
+            stale_paths = self._tracker.purge_deleted(
+                known_paths, prefix=_src_prefix,
+            )
 
             # ── Filter unchanged ───────────────────────────────────────────────
             to_process: list[Path] = []
             for fp in all_files:
-                if self._tracker.needs_processing(fp):
+                if self._tracker.needs_processing(fp, key=key_map[fp]):
                     to_process.append(fp)
                 else:
                     stats.skipped_unchanged += 1
@@ -716,6 +735,7 @@ class IngestionPipeline:
                 batcher,
                 stats,
                 on_progress,
+                key_map=key_map,
             )
 
             # ── Phase 2: OCR / image files (mini-batches to cap memory) ────────
@@ -755,6 +775,7 @@ class IngestionPipeline:
                         stats,
                         on_progress,
                         ocr_mode=True,
+                        key_map=key_map,
                     )
 
                     # Free RapidOCR models before loading embedder

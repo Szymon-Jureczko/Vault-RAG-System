@@ -128,7 +128,12 @@ class StateTracker:
             return None
         return FileRecord(**dict(row))
 
-    def needs_processing(self, file_path: str | Path) -> bool:
+    def needs_processing(
+        self,
+        file_path: str | Path,
+        *,
+        key: str | Path | None = None,
+    ) -> bool:
         """Determine whether *file_path* should be (re-)processed.
 
         A file needs processing when:
@@ -137,12 +142,16 @@ class StateTracker:
         * Its previous run failed or was interrupted.
 
         Args:
-            file_path: Path to the source document.
+            file_path: Path to the source document on disk (used for
+                computing the MD5 hash).
+            key: State-DB key to look up.  Defaults to *file_path* when
+                not provided.  Pass a source-relative path here so that
+                Azure temp-dir resyncs reuse the same DB record.
 
         Returns:
             ``True`` if the file should be queued for parsing.
         """
-        record = self.get_record(file_path)
+        record = self.get_record(key or file_path)
         if record is None:
             return True
         current_hash = compute_md5(file_path)
@@ -285,16 +294,32 @@ class StateTracker:
 
     # ── purge ──────────────────────────────────────────────────────────────
 
-    def purge_deleted(self, known_paths: set[str]) -> list[str]:
+    def purge_deleted(
+        self,
+        known_paths: set[str],
+        *,
+        prefix: str = "",
+    ) -> list[str]:
         """Remove state records for files no longer present on disk.
 
+        When *prefix* is given, only records whose ``file_path`` starts
+        with that prefix are considered.  This prevents an AZURE sync
+        from purging LOCAL records (and vice-versa).
+
         Args:
-            known_paths: Set of string paths currently on disk.
+            known_paths: Set of state-DB keys currently on disk.
+            prefix: Only consider records starting with this string.
 
         Returns:
             List of file paths that were removed from the state DB.
         """
-        rows = self.conn.execute("SELECT file_path FROM file_state").fetchall()
+        if prefix:
+            rows = self.conn.execute(
+                "SELECT file_path FROM file_state WHERE file_path LIKE ?",
+                (prefix + "%",),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT file_path FROM file_state").fetchall()
         stale = [
             row["file_path"] for row in rows if row["file_path"] not in known_paths
         ]
