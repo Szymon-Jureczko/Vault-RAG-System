@@ -84,7 +84,9 @@ class Settings(BaseSettings):
     state_db_path: Path = Path("data/state.db")
 
     # ── Concurrency ─────────────────────────────────────────────────────────
-    max_workers: int = 2  # non-OCR parsers; reduced to leave RAM for larger multilingual embedder
+    max_workers: int = (
+        2  # non-OCR parsers; reduced to leave RAM for larger multilingual embedder
+    )
     ocr_workers: int = 1  # OCR/image parsers — sequential is safer on 16 GB
 
     # ── Batch / OOM-safety ──────────────────────────────────────────────────
@@ -106,7 +108,7 @@ class Settings(BaseSettings):
 
     # ── LLM generation parameters ────────────────────────────────────────────
     llm_num_ctx: int = 6144
-    llm_num_predict: int = 512
+    llm_num_predict: int = 768
     llm_timeout: float = 120.0
     llm_temperature: float = 0.0
     llm_num_thread: int = 8

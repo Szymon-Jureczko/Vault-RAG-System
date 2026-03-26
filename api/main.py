@@ -401,7 +401,7 @@ def query_documents(request: QueryRequest) -> QueryResponse:
         # volume (e.g. multiple PDF pages outscoring a single-page OCR image)
         # and prevents the LLM from hallucinating connections between them.
         top_score = relevant[0].score
-        llm_chunks = [r for r in relevant[:3] if r.score >= top_score * 0.85]
+        llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
         answer = _generate_answer(request.question, llm_chunks or relevant[:1])
 
     return QueryResponse(
@@ -430,37 +430,37 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
         for r in results
     )
 
-    prompt = (
-        "Answer the question based on the context. Use only facts from the "
-        "context. Ignore metadata (dates, page numbers, headers). "
-        "Cite source at the end.\n\n"
-        "Example:\n"
-        "Context:\n"
-        "[Source: slides.png, Page 1]\n"
-        "TCP - Transmission Control Protocol\n"
-        "protokol warstwy transportowej\n"
-        "niezawodne polaczenie\n"
-        "3-way handshake\n"
-        "SYN, SYN-ACK, ACK\n\n"
-        "Question: Co to TCP?\n\n"
-        "Answer:\n"
-        "TCP (Transmission Control Protocol) to protokol warstwy "
-        "transportowej, ktory zapewnia niezawodne polaczenie miedzy "
-        "urzadzeniami. Nawiazanie polaczenia odbywa sie za pomoca "
-        "mechanizmu 3-way handshake, w ktorym wymieniane sa pakiety "
-        "SYN, SYN-ACK i ACK.\n\n"
-        "[slides.png, Page 1]\n\n"
-        "---\n\n"
+    system_prompt = (
+        "You are a study assistant that answers ONLY from the provided "
+        "context. You have NO knowledge of your own — treat the context as "
+        "your only source of truth.\n\n"
+        "STRICT RULES:\n"
+        "1. Use ONLY facts that are explicitly stated in the context. Never "
+        "add information from outside the context, even if you know it.\n"
+        "2. If the context does not contain enough information to answer "
+        "the question, say: \"The provided documents do not contain enough "
+        "information to answer this question.\"\n"
+        "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
+        "4. Cover the definition and the most important details (3-5 "
+        "sentences). Do not repeat yourself or pad the answer.\n"
+        "5. Do NOT add citations or source references — they are handled "
+        "separately."
+    )
+
+    user_message = (
         f"Context:\n{context}\n\n"
-        f"Question: {question}\n\nAnswer:"
+        f"Question: {question}"
     )
 
     try:
         response = httpx.post(
-            f"{settings.ollama_base_url}/api/generate",
+            f"{settings.ollama_base_url}/api/chat",
             json={
                 "model": settings.ollama_model_dev,
-                "prompt": prompt,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
                 "stream": False,
                 "options": {
                     "num_ctx": settings.llm_num_ctx,
@@ -472,7 +472,7 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
             timeout=settings.llm_timeout,
         )
         response.raise_for_status()
-        return response.json().get("response", "")
+        return response.json().get("message", {}).get("content", "")
     except Exception as exc:
         logger.warning("LLM generation failed: %s", exc)
         return f"(LLM unavailable: {exc})"

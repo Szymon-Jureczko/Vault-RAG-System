@@ -7,6 +7,7 @@ Covers the prompt construction fixes:
 - llm_num_ctx / llm_num_predict / llm_timeout settings flow into the Ollama call
 - new Settings fields have correct defaults
 - new Settings fields are overridable via environment variables
+- /api/chat endpoint is used with system + user messages
 """
 
 from __future__ import annotations
@@ -38,8 +39,14 @@ def _make_result(
 
 def _mock_httpx_response(answer: str = "test answer") -> MagicMock:
     resp = MagicMock()
-    resp.json.return_value = {"response": answer}
+    resp.json.return_value = {"message": {"content": answer}}
     return resp
+
+
+def _get_user_content(captured: list[dict]) -> str:
+    """Extract the user message content from a captured /api/chat payload."""
+    messages = captured[0]["messages"]
+    return next(m["content"] for m in messages if m["role"] == "user")
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -69,11 +76,11 @@ class TestGenerateAnswerPrompt:
             _generate_answer("What literature?", results)
 
         assert captured, "httpx.post was not called"
-        prompt: str = captured[0]["prompt"]
+        user_content = _get_user_content(captured)
         # The doubled pattern would be e.g.
         # "[Source: MiSR1.pdf, Page 1]\n[Source: MiSR1.pdf]"
-        assert "[Source: MiSR1.pdf]\n[Source:" not in prompt
-        assert "[Source: MiSR2.pdf]\n[Source:" not in prompt
+        assert "[Source: MiSR1.pdf]\n[Source:" not in user_content
+        assert "[Source: MiSR2.pdf]\n[Source:" not in user_content
 
     def test_page_none_not_in_prompt(self) -> None:
         """'Page None' must never appear in the prompt for non-PDF chunks."""
@@ -90,8 +97,8 @@ class TestGenerateAnswerPrompt:
             mock_httpx.post.side_effect = fake_post
             _generate_answer("Any question?", results)
 
-        prompt: str = captured[0]["prompt"]
-        assert "Page None" not in prompt
+        user_content = _get_user_content(captured)
+        assert "Page None" not in user_content
 
     def test_page_number_rendered_in_prompt(self) -> None:
         """When citation.page is set, the page number must appear in the prompt."""
@@ -108,8 +115,47 @@ class TestGenerateAnswerPrompt:
             mock_httpx.post.side_effect = fake_post
             _generate_answer("Question?", results)
 
-        prompt: str = captured[0]["prompt"]
-        assert "Page 5" in prompt
+        user_content = _get_user_content(captured)
+        assert "Page 5" in user_content
+
+    def test_uses_chat_endpoint_with_system_message(self) -> None:
+        """Must call /api/chat with separate system and user messages."""
+        results = [_make_result("text", page=1)]
+        captured: list[dict] = []
+        captured_urls: list[str] = []
+
+        def fake_post(url: str, *, json: dict, timeout: float) -> MagicMock:
+            captured.append(json)
+            captured_urls.append(url)
+            return _mock_httpx_response()
+
+        with patch("api.main.httpx") as mock_httpx:
+            mock_httpx.post.side_effect = fake_post
+            _generate_answer("Q?", results)
+
+        assert captured_urls[0].endswith("/api/chat")
+        messages = captured[0]["messages"]
+        roles = [m["role"] for m in messages]
+        assert roles == ["system", "user"]
+
+    def test_system_prompt_enforces_grounding(self) -> None:
+        """System message must instruct the model to use only context facts."""
+        results = [_make_result("text", page=1)]
+        captured: list[dict] = []
+
+        def fake_post(url: str, *, json: dict, timeout: float) -> MagicMock:
+            captured.append(json)
+            return _mock_httpx_response()
+
+        with patch("api.main.httpx") as mock_httpx:
+            mock_httpx.post.side_effect = fake_post
+            _generate_answer("Q?", results)
+
+        system_content = next(
+            m["content"] for m in captured[0]["messages"] if m["role"] == "system"
+        )
+        assert "ONLY" in system_content
+        assert "do not contain enough information" in system_content.lower()
 
 
 class TestGenerateAnswerSettings:
@@ -155,7 +201,7 @@ class TestSettingsNewFields:
         """llm_num_ctx / llm_num_predict / llm_timeout must have safe defaults."""
         s = Settings(_env_file=None)  # type: ignore[call-arg]
         assert s.llm_num_ctx == 6144
-        assert s.llm_num_predict == 512
+        assert s.llm_num_predict == 768
         assert s.llm_timeout == 120.0
         assert s.llm_temperature == 0.0
         assert s.llm_num_thread == 8
