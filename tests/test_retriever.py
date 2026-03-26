@@ -23,7 +23,6 @@ from rank_bm25 import BM25Okapi
 
 from vector_db.retriever import Citation, HybridRetriever, RetrievalResult
 
-
 # ---------------------------------------------------------------------------
 # Unit: pydantic models
 # ---------------------------------------------------------------------------
@@ -149,8 +148,7 @@ class TestBM25Tokenizer:
         other_a = "[Source: log_2024.txt]\nTechnical specification project"
         other_b = "[Source: report_data.csv]\nBudget analysis annual figures"
         tokenized = [
-            re.findall(r"\w+", t.lower())
-            for t in (match_text, other_a, other_b)
+            re.findall(r"\w+", t.lower()) for t in (match_text, other_a, other_b)
         ]
         bm25 = BM25Okapi(tokenized)
         query_tokens = re.findall(
@@ -272,16 +270,16 @@ class TestHybridRetrieverIntegration:
     def test_filename_search_direct(self, retriever):
         """_filename_search must return at least one chunk whose metadata
         filename matches exactly when queried by name."""
-        hits = retriever._filename_search("what can you tell me about img_0031.png?")
+        hits = retriever._filename_search("what can you tell me about img_0000.png?")
         assert len(hits) > 0
-        assert all(meta.get("filename") == "img_0031.png" for _, _, meta, _ in hits)
+        assert all(meta.get("filename") == "img_0000.png" for _, _, meta, _ in hits)
 
     def test_filename_query_returns_correct_file(self, retriever):
         """The main regression test: querying by filename must surface that file
         in the top results."""
-        results = retriever.query("what can you tell me about img_0031.png?", top_k=5)
+        results = retriever.query("what can you tell me about img_0000.png?", top_k=5)
         filenames = [r.citation.filename for r in results]
-        assert "img_0031.png" in filenames
+        assert "img_0000.png" in filenames
 
     def test_semantic_query_still_works(self, retriever):
         """A regular semantic query (no filename) must still return top_k results."""
@@ -298,18 +296,18 @@ class TestHybridRetrieverIntegration:
 
     def test_phrase_search_direct(self, retriever):
         """_phrase_search must return at least one chunk whose text contains
-        'Angela Graham' verbatim (stored in img_0037.png)."""
+        'Hunter Ltd' verbatim (stored in img_0000.png)."""
         hits = retriever._phrase_search(
-            "What do documents authored by Angela Graham concern?"
+            "What do documents from Hunter Ltd concern?"
         )
         assert len(hits) > 0
         filenames = {meta.get("filename") for _, _, meta, _ in hits}
-        assert "img_0037.png" in filenames
+        assert "img_0000.png" in filenames
 
     def test_author_query_returns_correct_file(self, retriever):
-        """End-to-end: querying by author name must surface the correct document."""
+        """End-to-end: querying by a name unique to one document must surface it."""
         results = retriever.query(
-            "What do documents authored by Angela Graham concern?", top_k=5
+            "What do documents from Hunter Ltd concern?", top_k=5
         )
         filenames = [r.citation.filename for r in results]
-        assert "img_0037.png" in filenames
+        assert "img_0000.png" in filenames

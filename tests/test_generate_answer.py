@@ -154,7 +154,7 @@ class TestSettingsNewFields:
     def test_new_fields_have_correct_defaults(self) -> None:
         """llm_num_ctx / llm_num_predict / llm_timeout must have safe defaults."""
         s = Settings(_env_file=None)  # type: ignore[call-arg]
-        assert s.llm_num_ctx == 4096
+        assert s.llm_num_ctx == 6144
         assert s.llm_num_predict == 512
         assert s.llm_timeout == 120.0
         assert s.llm_temperature == 0.0
