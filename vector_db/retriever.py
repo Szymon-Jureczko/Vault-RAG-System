@@ -186,6 +186,8 @@ class HybridRetriever:
         self._corpus_metas: list[dict] = []
         self._bm25_index_path = Path(str(chroma_path)) / "bm25_index.pkl"
 
+        self._load_or_build_bm25_index()
+
     @staticmethod
     def _init_embedder(model_name: str):
         """Initialise embedding backend (ONNX-first, PyTorch fallback).
@@ -563,6 +565,7 @@ class HybridRetriever:
         top_k: int = 5,
         semantic_candidates: int = 20,
         bm25_candidates: int = 20,
+        source_filter: str | None = None,
     ) -> list[RetrievalResult]:
         """Execute a hybrid search with reranking and citations.
 
@@ -571,6 +574,8 @@ class HybridRetriever:
             top_k: Number of final results to return.
             semantic_candidates: Candidates from semantic search.
             bm25_candidates: Candidates from BM25 search.
+            source_filter: If set (e.g. ``"azure"`` or ``"local"``), only
+                chunks whose ``ingestion_source`` metadata matches are kept.
 
         Returns:
             Top-K RetrievalResult instances with citations.
@@ -603,6 +608,14 @@ class HybridRetriever:
         if phrase_hits:
             seen_ids = {c[0] for c in candidates}
             candidates += [c for c in phrase_hits if c[0] not in seen_ids]
+
+        # Step 3d: Filter by ingestion source when requested
+        if source_filter:
+            _sf = source_filter.lower()
+            candidates = [
+                c for c in candidates
+                if c[2].get("ingestion_source", "local") == _sf
+            ]
 
         # Step 4: Cross-encoder reranking
         reranked = self._rerank(query_text, candidates, top_k)
