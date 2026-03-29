@@ -36,7 +36,7 @@ EML_EXTENSIONS = {".eml"}
 # ── OCR gating constants ────────────────────────────────────────────────────
 _OCR_MIN_FILE_BYTES: int = 10_000  # skip images < 10 KB
 _OCR_VARIANCE_THRESHOLD: float = 100.0  # skip near-blank/solid-colour images
-_OCR_TARGET_WIDTH: int = 1800  # rescale to ~300 DPI equivalent
+_OCR_TARGET_WIDTH: int = 1200  # rescale for OCR — lower = less memory
 
 # ── PDF text-density probe ──────────────────────────────────────────────────
 _PDF_TEXT_THRESHOLD: int = 50  # avg chars/page below this → scanned
@@ -351,7 +351,7 @@ class ScannedPDFParser(BaseParser):
                 for i in range(len(doc)):
                     page = doc[i]
                     page_num = i + 1
-                    pix = page.get_pixmap(dpi=300, colorspace=fitz.csGRAY)
+                    pix = page.get_pixmap(dpi=150, colorspace=fitz.csGRAY)
                     gray = (
                         np.frombuffer(
                             pix.samples,
@@ -431,7 +431,7 @@ class RapidOCRParser(BaseParser):
         if cls._engine is None:
             from rapidocr_onnxruntime import RapidOCR
 
-            cls._engine = RapidOCR(det_limit_side_len=1920)
+            cls._engine = RapidOCR(det_limit_side_len=1280)
         return cls._engine
 
     @property
