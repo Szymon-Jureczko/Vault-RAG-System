@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from ingestion.config import settings
 from ingestion.pipeline import IngestionStats
 from ingestion.state_tracker import StateTracker
+from ingestion.sync_worker import sync_worker as _sync_target
 from vector_db.retriever import HybridRetriever, RetrievalResult
 
 logger = logging.getLogger(__name__)
@@ -47,13 +48,16 @@ app = FastAPI(
 # ── Lazy singletons ─────────────────────────────────────────────────────────
 
 _retriever: HybridRetriever | None = None
+_retriever_lock = threading.Lock()
 
 
 def _get_retriever() -> HybridRetriever:
-    """Lazily initialise the HybridRetriever singleton."""
+    """Lazily initialise the HybridRetriever singleton (thread-safe)."""
     global _retriever
     if _retriever is None:
-        _retriever = HybridRetriever()
+        with _retriever_lock:
+            if _retriever is None:
+                _retriever = HybridRetriever()
     return _retriever
 
 
@@ -124,10 +128,14 @@ class QueryRequest(BaseModel):
     Attributes:
         question: Natural language query.
         top_k: Number of results to return.
+        ingestion_source: Optional source filter (``'local'`` or ``'azure'``).
+            When set, only chunks from that ingestion source are returned.
+            Defaults to ``None`` (no filtering).
     """
 
     question: str
     top_k: int = 10
+    ingestion_source: str | None = None
 
 
 class CitationOut(BaseModel):
@@ -173,55 +181,10 @@ class QueryResponse(BaseModel):
 
 
 # ── Sync worker (runs in a subprocess — its own GIL) ─────────────────────
-
-
-def _sync_worker(
-    source_dir: str,
-    job_id: str,
-    progress_file: str,
-    ingestion_source: str = "LOCAL",
-    azure_storage_connection_string: str = "",
-    azure_container_name: str = "",
-) -> None:
-    """Ingestion worker that runs in a separate process.
-
-    Writes progress snapshots to a JSON file so the API server
-    (which has its own GIL) can serve poll requests without blocking.
-
-    Env vars for the Azure source are set before any ingestion imports
-    so the ``Settings()`` singleton in the subprocess picks them up.
-    """
-    os.environ["INGESTION_SOURCE"] = ingestion_source
-    if azure_storage_connection_string:
-        os.environ["AZURE_STORAGE_CONNECTION_STRING"] = azure_storage_connection_string
-    if azure_container_name:
-        os.environ["AZURE_CONTAINER_NAME"] = azure_container_name
-
-    from ingestion.pipeline import IngestionPipeline
-
-    def _write(status: str, stats: IngestionStats | None) -> None:
-        data: dict = {"status": status, "job_id": job_id}
-        if stats is not None:
-            data["stats"] = stats.model_dump()
-        tmp = progress_file + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, progress_file)
-
-    try:
-        pipeline = IngestionPipeline()
-        stats = pipeline.run(
-            Path(source_dir),
-            on_progress=lambda s: _write("running", s),
-            ingestion_source=ingestion_source,
-            azure_connection_string=azure_storage_connection_string,
-            azure_container_name=azure_container_name,
-        )
-        pipeline.close()
-        _write("completed", stats)
-    except Exception as exc:
-        logger.error("Sync worker %s failed: %s", job_id, exc)
-        _write(f"failed: {exc}", None)
+# The worker lives in ingestion.sync_worker so that the subprocess
+# (spawned via mp.get_context("spawn")) only imports lightweight
+# ingestion modules — NOT api.main which pulls in PyTorch, ChromaDB,
+# FastAPI, etc. (~300 MB saved).
 
 
 def _wait_and_refresh(
@@ -286,7 +249,7 @@ def sync_documents(request: SyncRequest) -> SyncResponse:
 
     ctx = mp.get_context("spawn")
     proc = ctx.Process(
-        target=_sync_worker,
+        target=_sync_target,
         args=(
             str(source),
             job_id,
@@ -375,7 +338,11 @@ def query_documents(request: QueryRequest) -> QueryResponse:
         QueryResponse with ranked results and citations.
     """
     retriever = _get_retriever()
-    results = retriever.query(request.question, top_k=request.top_k)
+    results = retriever.query(
+        request.question,
+        top_k=request.top_k,
+        source_filter=request.ingestion_source,
+    )
 
     # Filter to chunks the cross-encoder considers relevant (score > 0).
     # Negative-score chunks are not useful as citations or LLM context.
@@ -394,13 +361,16 @@ def query_documents(request: QueryRequest) -> QueryResponse:
         for r in relevant
     ]
 
-    # ── Optional LLM answer generation ──────────────────────────────
+    # ── Query Router: structured (SQL) vs unstructured (RAG) ────────
     answer = ""
-    if relevant:
-        # Only send chunks that score at least 85 % of the top chunk's score.
-        # This drops irrelevant results that happen to rank in the top-3 by
-        # volume (e.g. multiple PDF pages outscoring a single-page OCR image)
-        # and prevents the LLM from hallucinating connections between them.
+    query_type = _classify_query(request.question)
+    logger.info("Router classified %r as %s", request.question[:80], query_type)
+
+    if query_type == "structured":
+        answer = _handle_structured_query(request.question)
+
+    # Fallback to RAG if structured agent returned nothing, or if unstructured
+    if not answer and relevant:
         top_score = relevant[0].score
         llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
         answer = _generate_answer(request.question, llm_chunks or relevant[:1])
@@ -428,7 +398,11 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
         StreamingResponse with ``text/event-stream`` content type.
     """
     retriever = _get_retriever()
-    results = retriever.query(request.question, top_k=request.top_k)
+    results = retriever.query(
+        request.question,
+        top_k=request.top_k,
+        source_filter=request.ingestion_source,
+    )
 
     relevant = [r for r in results if r.score > 0] or results[:1]
 
@@ -448,16 +422,29 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
     top_score = relevant[0].score if relevant else 0
     llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
 
+    # ── Query Router: structured (SQL) vs unstructured (RAG) ────────
+    query_type = _classify_query(request.question)
+    logger.info("Router classified %r as %s", request.question[:80], query_type)
+
+    sql_stream: Iterator[str] | None = None
+    if query_type == "structured":
+        sql_stream = _handle_structured_query_stream(request.question)
+
     def event_generator() -> Iterator[str]:
         # 1. Send citations immediately so the UI can show them
         yield f"event: citations\ndata: {json.dumps(result_items)}\n\n"
 
-        # 2. Stream LLM tokens
-        for token in _stream_answer(
-            request.question, llm_chunks or relevant[:1]
-        ):
-            escaped = json.dumps(token)
-            yield f"event: token\ndata: {escaped}\n\n"
+        # 2. Stream LLM tokens — SQL agent or RAG fallback
+        if sql_stream is not None:
+            for token in sql_stream:
+                escaped = json.dumps(token)
+                yield f"event: token\ndata: {escaped}\n\n"
+        else:
+            for token in _stream_answer(
+                request.question, llm_chunks or relevant[:1]
+            ):
+                escaped = json.dumps(token)
+                yield f"event: token\ndata: {escaped}\n\n"
 
         # 3. Signal completion
         yield "event: done\ndata: {}\n\n"
@@ -469,10 +456,430 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
     )
 
 
+# ── Query Router + Text-to-SQL Data Agent ─────────────────────────────────
+
+
+def _classify_query(question: str) -> str:
+    """Classify a question as 'structured' or 'unstructured' using Ollama.
+
+    Uses a minimal prompt with aggressive context/predict limits for
+    fast classification (~1 s on CPU).
+
+    Args:
+        question: The user's question.
+
+    Returns:
+        ``'structured'`` or ``'unstructured'``.
+    """
+    payload = {
+        "model": settings.ollama_model_dev,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Classify the user's question. Reply with exactly one word.\n"
+                    "Reply STRUCTURED if the question asks for a number, "
+                    "calculation, statistic, count, sum, average, comparison "
+                    "of values, ranking, filtering, or any answer that requires "
+                    "data from a table or spreadsheet.\n"
+                    "Reply UNSTRUCTURED for everything else."
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+        "stream": False,
+        "options": {"num_ctx": 256, "num_predict": 4, "temperature": 0.0},
+    }
+    try:
+        resp = httpx.post(
+            f"{settings.ollama_base_url}/api/chat",
+            json=payload,
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        answer = resp.json().get("message", {}).get("content", "").strip().upper()
+        if answer.startswith("S"):
+            return "structured"
+    except Exception as exc:
+        logger.warning(
+            "Router classification failed: %s — defaulting to unstructured", exc
+        )
+    return "unstructured"
+
+
+def _get_tabular_schema() -> str | None:
+    """Read the tabular metadata table and build a schema prompt block.
+
+    Returns:
+        Schema description string, or ``None`` if no tabular data exists.
+    """
+    import json
+    import sqlite3
+
+    db_path = settings.tabular_db_path
+    if not db_path.exists():
+        return None
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT table_name, source_file, sheet_name, description, "
+            "columns_json, row_count FROM _tabular_meta "
+            "ORDER BY source_file, table_name"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return None
+
+    if not rows:
+        conn.close()
+        return None
+
+    parts = []
+    for row in rows:
+        cols = json.loads(row["columns_json"])
+        col_str = ", ".join(f"{name} ({dtype})" for name, dtype in cols.items())
+        sheet_info = f", sheet: {row['sheet_name']}" if row["sheet_name"] else ""
+        desc = row["description"]
+        desc_info = f"\n  Description: {desc} — ALL rows belong to this dataset." if desc else ""
+        block = (
+            f"Table: {row['table_name']} "
+            f"(source: {row['source_file']}{sheet_info}, "
+            f"{row['row_count']} rows)"
+            f"{desc_info}\n"
+            f"  Columns: {col_str}"
+        )
+        # Include sample rows so the LLM understands actual data values
+        try:
+            sample = conn.execute(
+                f"SELECT * FROM \"{row['table_name']}\" LIMIT 3"
+            ).fetchall()
+            if sample:
+                col_names = list(cols.keys())
+                header = " | ".join(col_names)
+                sample_lines = [
+                    " | ".join(str(s[c]) for c in col_names)
+                    for s in sample
+                ]
+                block += f"\n  Sample rows:\n  {header}\n  " + "\n  ".join(
+                    sample_lines
+                )
+        except Exception:
+            pass
+        parts.append(block)
+    conn.close()
+    return "\n\n".join(parts)
+
+
+def _generate_sql(question: str, schema: str) -> str:
+    """Ask the LLM to generate a SQL SELECT for the given question.
+
+    Args:
+        question: The user's natural-language question.
+        schema: Schema description of available tables.
+
+    Returns:
+        Raw SQL string from the LLM.
+    """
+    payload = {
+        "model": settings.ollama_model_dev,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a SQL generator. Given the SQLite schema below, "
+                    "write a single SELECT statement that answers the user's "
+                    "question. Output ONLY the SQL query, nothing else. "
+                    "Do not wrap it in markdown code fences.\n\n"
+                    f"Schema:\n{schema}\n\n"
+                    "Rules:\n"
+                    "- Use only tables and columns shown above.\n"
+                    "- SQLite syntax only.\n"
+                    "- Always wrap column and table names in double quotes.\n"
+                    "- IMPORTANT: Each table already contains ALL rows for "
+                    "its dataset. Do NOT add a WHERE clause to filter by a "
+                    "company name, dataset name, or source name. Only use "
+                    "WHERE if the user asks to filter by a value that "
+                    "actually appears in the sample rows (e.g. a specific "
+                    "employee name, region, or date).\n"
+                    "- SQLite has no MEDIAN(). To compute a median, use:\n"
+                    "  SELECT val FROM tbl ORDER BY val "
+                    "LIMIT 1 OFFSET (SELECT COUNT(*) FROM tbl) / 2;\n"
+                    "- Never use INSERT, UPDATE, DELETE, DROP, ALTER, or CREATE.\n"
+                    "- If the question cannot be answered, reply: "
+                    "SELECT 'NOT_ANSWERABLE' AS error;"
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+        "stream": False,
+        "options": {
+            "num_ctx": settings.llm_num_ctx,
+            "num_predict": 256,
+            "temperature": 0.0,
+        },
+    }
+    resp = httpx.post(
+        f"{settings.ollama_base_url}/api/chat",
+        json=payload,
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    raw = resp.json().get("message", {}).get("content", "").strip()
+    # Strip markdown code fences if the model includes them
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[-1]
+    if raw.endswith("```"):
+        raw = raw.rsplit("```", 1)[0]
+    return raw.strip()
+
+
+def _execute_sql_safely(sql: str) -> list[dict]:
+    """Execute a read-only SQL query against the tabular database.
+
+    Three safety layers: ``PRAGMA query_only``, SELECT-only validation,
+    and a 5-second progress-handler timeout.
+
+    Args:
+        sql: A SELECT statement.
+
+    Returns:
+        List of row dicts.
+
+    Raises:
+        ValueError: If the SQL is not a SELECT or is otherwise unsafe.
+    """
+    import sqlite3
+    import time
+
+    cleaned = sql.strip().rstrip(";").strip()
+    if not cleaned.upper().startswith("SELECT"):
+        raise ValueError(f"Only SELECT statements are allowed, got: {cleaned[:50]}")
+    if ";" in cleaned:
+        raise ValueError("Multi-statement SQL is not allowed")
+
+    conn = sqlite3.connect(str(settings.tabular_db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+
+    deadline = time.monotonic() + 5.0
+
+    def _progress_check() -> int:
+        return 1 if time.monotonic() > deadline else 0
+
+    conn.set_progress_handler(_progress_check, 1000)
+
+    try:
+        cursor = conn.execute(cleaned)
+        columns = (
+            [desc[0] for desc in cursor.description] if cursor.description else []
+        )
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+_SQL_RESULT_SYSTEM_PROMPT = (
+    "You are a data reporting assistant. The user asked a question "
+    "and a SQL query was run to answer it. Summarize the results "
+    "in a clear, natural-language response.\n\n"
+    "RULES:\n"
+    "1. Report the numbers directly from the query results.\n"
+    "2. Be concise but complete.\n"
+    "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
+    "4. Do NOT show the SQL query.\n"
+    "5. Do NOT add citations or source references."
+)
+
+
+def _format_sql_result(question: str, sql: str, rows: list[dict]) -> str:
+    """Format SQL result rows into a natural-language answer via LLM.
+
+    Args:
+        question: Original user question.
+        sql: The SQL that was executed.
+        rows: Result rows as dicts.
+
+    Returns:
+        Natural language answer string.
+    """
+    result_text = json.dumps(rows[:50], default=str, ensure_ascii=False)
+    if len(rows) > 50:
+        result_text += f"\n... ({len(rows)} total rows, showing first 50)"
+
+    payload = {
+        "model": settings.ollama_model_dev,
+        "messages": [
+            {"role": "system", "content": _SQL_RESULT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nQuery results:\n{result_text}",
+            },
+        ],
+        "stream": False,
+        "options": {
+            "num_ctx": settings.llm_num_ctx,
+            "num_predict": settings.llm_num_predict,
+            "temperature": settings.llm_temperature,
+            "num_thread": settings.llm_num_thread,
+        },
+    }
+    resp = httpx.post(
+        f"{settings.ollama_base_url}/api/chat",
+        json=payload,
+        timeout=settings.llm_timeout,
+    )
+    resp.raise_for_status()
+    return resp.json().get("message", {}).get("content", "")
+
+
+def _stream_sql_result(
+    question: str, sql: str, rows: list[dict]
+) -> Iterator[str]:
+    """Stream a natural-language answer from SQL results, token by token."""
+    result_text = json.dumps(rows[:50], default=str, ensure_ascii=False)
+    if len(rows) > 50:
+        result_text += f"\n... ({len(rows)} total rows, showing first 50)"
+
+    payload = {
+        "model": settings.ollama_model_dev,
+        "messages": [
+            {"role": "system", "content": _SQL_RESULT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nQuery results:\n{result_text}",
+            },
+        ],
+        "stream": True,
+        "options": {
+            "num_ctx": settings.llm_num_ctx,
+            "num_predict": settings.llm_num_predict,
+            "temperature": settings.llm_temperature,
+            "num_thread": settings.llm_num_thread,
+        },
+    }
+    try:
+        with httpx.stream(
+            "POST",
+            f"{settings.ollama_base_url}/api/chat",
+            json=payload,
+            timeout=httpx.Timeout(
+                connect=10.0, read=settings.llm_timeout, write=10.0, pool=10.0
+            ),
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    yield token
+    except Exception as exc:
+        logger.warning("SQL result streaming failed: %s", exc)
+        yield f"(LLM unavailable: {exc})"
+
+
+def _sql_result_is_empty(rows: list[dict]) -> bool:
+    """Check if SQL result is effectively empty (no rows, or all values NULL)."""
+    if not rows:
+        return True
+    if len(rows) == 1:
+        vals = list(rows[0].values())
+        if all(v is None for v in vals):
+            return True
+    return False
+
+
+def _handle_structured_query(question: str) -> str:
+    """Execute the full Text-to-SQL data agent pipeline (non-streaming).
+
+    Returns:
+        Natural language answer, or ``""`` on failure (signals RAG fallback).
+    """
+    schema = _get_tabular_schema()
+    if not schema:
+        return ""
+
+    try:
+        sql = _generate_sql(question, schema)
+        logger.info("Data agent SQL: %s", sql)
+        rows = _execute_sql_safely(sql)
+
+        if rows and "error" in rows[0] and rows[0]["error"] == "NOT_ANSWERABLE":
+            return ""
+
+        # Retry once if the result is empty — the model likely added a
+        # spurious WHERE clause.
+        if _sql_result_is_empty(rows):
+            logger.info("Data agent got empty result, retrying without WHERE hint")
+            retry_q = (
+                f"{question}\n\n"
+                f"(Hint: A previous query returned no results. "
+                f"Do NOT filter by company or dataset name — "
+                f"the table already contains all the data.)"
+            )
+            sql = _generate_sql(retry_q, schema)
+            logger.info("Data agent retry SQL: %s", sql)
+            rows = _execute_sql_safely(sql)
+
+        if _sql_result_is_empty(rows):
+            return ""
+
+        return _format_sql_result(question, sql, rows)
+    except Exception as exc:
+        logger.warning("Structured query agent failed: %s", exc)
+        return ""
+
+
+def _handle_structured_query_stream(question: str) -> Iterator[str] | None:
+    """Execute the Text-to-SQL data agent pipeline (streaming).
+
+    Returns:
+        Iterator of tokens, or ``None`` to signal fallback to RAG.
+    """
+    schema = _get_tabular_schema()
+    if not schema:
+        return None
+
+    try:
+        sql = _generate_sql(question, schema)
+        logger.info("Data agent SQL: %s", sql)
+        rows = _execute_sql_safely(sql)
+
+        if rows and "error" in rows[0] and rows[0]["error"] == "NOT_ANSWERABLE":
+            return None
+
+        # Retry once if the result is empty
+        if _sql_result_is_empty(rows):
+            logger.info("Data agent got empty result, retrying without WHERE hint")
+            retry_q = (
+                f"{question}\n\n"
+                f"(Hint: A previous query returned no results. "
+                f"Do NOT filter by company or dataset name — "
+                f"the table already contains all the data.)"
+            )
+            sql = _generate_sql(retry_q, schema)
+            logger.info("Data agent retry SQL: %s", sql)
+            rows = _execute_sql_safely(sql)
+
+        if _sql_result_is_empty(rows):
+            return None
+
+        return _stream_sql_result(question, sql, rows)
+    except Exception as exc:
+        logger.warning("Structured query agent failed: %s", exc)
+        return None
+
+
+# ── LLM prompt builder (unstructured RAG path) ───────────────────────────
+
+
 def _build_llm_payload(
     question: str, results: list[RetrievalResult], *, stream: bool = False
 ) -> dict:
-    """Build the Ollama /api/chat JSON payload.
+    """Build the Ollama /api/chat JSON payload for unstructured RAG.
 
     Args:
         question: The user's question.
@@ -499,14 +906,18 @@ def _build_llm_payload(
         "1. Use ONLY facts that are explicitly stated in the context. Never "
         "add information from outside the context, even if you know it.\n"
         "2. If the context does not contain enough information to answer "
-        "the question, say: \"The provided documents do not contain enough "
-        "information to answer this question.\"\n"
+        'the question, say: "The provided documents do not contain enough '
+        'information to answer this question."\n'
         "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
-        "4. Give a thorough, educational answer. Start with a clear "
-        "definition, then explain key details, categories, applications, "
-        "or examples mentioned in the context. Aim for a comprehensive "
-        "response that covers the most important information available "
-        "in the provided sources. Do not repeat yourself.\n"
+        "4. SYNTHESIZE information across ALL provided sources into one "
+        "coherent answer — do not just parrot or summarise a single "
+        "source. Merge overlapping ideas, resolve redundancies, and "
+        "combine unique details from each source. If two sources say "
+        "the same thing in different words, state the idea ONCE in your "
+        "own words. Start with a clear definition, then explain key "
+        "details, categories, applications, or examples. Aim for a "
+        "comprehensive response that adds value beyond any single "
+        "source alone.\n"
         "5. Do NOT add citations or source references — they are handled "
         "separately."
     )

@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import ctypes
 import gc
 import logging
 import tempfile
@@ -40,6 +41,21 @@ from ingestion.parser import (
 from ingestion.state_tracker import StateTracker, compute_md5
 
 logger = logging.getLogger(__name__)
+
+
+def _release_memory() -> None:
+    """Force Python GC and glibc to return freed memory to the OS.
+
+    ``gc.collect()`` alone marks objects for collection but glibc's
+    allocator keeps the pages mapped.  ``malloc_trim(0)`` forces it
+    to return unused heap pages to the kernel — critical for staying
+    under container memory limits between phases.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 class IngestionStats(BaseModel):
@@ -100,7 +116,11 @@ class BatchCommitter:
             filename: Bare filename (e.g. ``"report.docx"``).
         """
         try:
-            self._collection.delete(where={"filename": filename})
+            existing = self._collection.get(where={"filename": filename})
+            count = len(existing["ids"]) if existing["ids"] else 0
+            if count:
+                self._collection.delete(where={"filename": filename})
+                logger.info("Deleted %d chunks for file %s", count, filename)
         except Exception as exc:
             logger.warning("Could not delete old chunks for %s: %s", filename, exc)
 
@@ -472,6 +492,7 @@ class IngestionPipeline:
         ocr_mode: bool = False,
         *,
         key_map: dict[Path, str] | None = None,
+        ingestion_source: str = "local",
     ) -> list[tuple[str, str, dict]]:
         """Parse, embed, and commit one phase of files with per-file state updates.
 
@@ -544,6 +565,8 @@ class IngestionPipeline:
 
                     if result.success and result.chunks:
                         batcher.delete_for_file(fp.name)
+                        for chunk in result.chunks:
+                            chunk.metadata["ingestion_source"] = ingestion_source
                         if ocr_mode:
                             for chunk in result.chunks:
                                 pending_chunks.append(
@@ -714,7 +737,11 @@ class IngestionPipeline:
 
             # ── Clean up ChromaDB chunks for deleted files ─────────────────────
             for sp in stale_paths:
-                batcher.delete_for_file(Path(sp).name)
+                # sp is a state-DB key like "azure:subdir/file.xlsx";
+                # strip the "<source>:" prefix before extracting the bare
+                # filename so the ChromaDB where-filter matches.
+                bare = sp.split(":", 1)[-1] if ":" in sp else sp
+                batcher.delete_for_file(Path(bare).name)
             if stale_paths:
                 logger.info(
                     "Purged ChromaDB chunks for %d deleted files",
@@ -736,18 +763,18 @@ class IngestionPipeline:
                 stats,
                 on_progress,
                 key_map=key_map,
+                ingestion_source=eff_source.lower(),
             )
 
             # ── Phase 2: OCR / image files (mini-batches to cap memory) ────────
             _OCR_BATCH = 10
             if ocr_files:
                 # Flush remaining Phase 1 chunks then unload the embedding
-                # model (~300 MB) so RapidOCR's ONNX models (~400 MB) can
-                # fit in memory alongside ChromaDB.
+                # model so RapidOCR's ONNX models can fit in memory.
                 batcher.flush()
                 batcher._embed = None
                 del embed_fn
-                gc.collect()
+                _release_memory()
                 logger.info("Embedding model unloaded to free memory for OCR")
 
                 stats.phase = "ocr"
@@ -776,13 +803,14 @@ class IngestionPipeline:
                         on_progress,
                         ocr_mode=True,
                         key_map=key_map,
+                        ingestion_source=eff_source.lower(),
                     )
 
                     # Free RapidOCR models before loading embedder
                     from ingestion.parser import RapidOCRParser
 
                     RapidOCRParser._engine = None
-                    gc.collect()
+                    _release_memory()
 
                     # Reload embedding model (reuses existing collection)
                     batch_embed_fn = self._init_embed_fn()
@@ -797,11 +825,19 @@ class IngestionPipeline:
                     # Unload embedding model for next OCR batch
                     batcher._embed = None
                     del batch_embed_fn
-                    gc.collect()
+                    _release_memory()
 
             stats.current_file = ""
             stats.phase = "done"
             batcher.finalize()
+
+            # Free embedding model and ChromaDB refs before tabular ingestion
+            batcher._embed = None
+            del collection
+            _release_memory()
+
+            # ── Tabular ingestion (xlsx/csv → SQLite for Text-to-SQL) ────────
+            self._ingest_tabular(fast_files, stale_paths=stale_paths)
 
             logger.info(
                 "Pipeline complete: %d processed, %d failed, %d chunks",
@@ -815,6 +851,198 @@ class IngestionPipeline:
             if _tmp_dir is not None:
                 _tmp_dir.cleanup()
                 logger.debug("Cleaned up Azure temp dir: %s", _tmp_dir.name)
+
+    def _ingest_tabular(
+        self, files: list[Path], stale_paths: list[str] | None = None
+    ) -> int:
+        """Load xlsx/csv files into SQLite tables for Text-to-SQL queries.
+
+        Args:
+            files: List of files to process (only xlsx/csv are selected).
+            stale_paths: State-DB keys of deleted files whose tables
+                should be purged.
+
+        Returns:
+            Number of tables created.
+        """
+        import json
+        import re
+        import sqlite3
+        from datetime import datetime, timezone
+
+        import pandas as pd
+
+        tabular_exts = {".xlsx", ".csv"}
+        tabular_files = [f for f in files if f.suffix.lower() in tabular_exts]
+
+        db_path = settings.tabular_db_path
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _tabular_meta ("
+            "  table_name   TEXT PRIMARY KEY,"
+            "  source_file  TEXT NOT NULL,"
+            "  sheet_name   TEXT NOT NULL DEFAULT '',"
+            "  description  TEXT NOT NULL DEFAULT '',"
+            "  columns_json TEXT NOT NULL,"
+            "  row_count    INTEGER NOT NULL,"
+            "  ingested_at  TEXT NOT NULL"
+            ")"
+        )
+        # Migration: add description column if it doesn't exist yet
+        try:
+            conn.execute("ALTER TABLE _tabular_meta ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+        # Purge tables for deleted files
+        if stale_paths:
+            for sp in stale_paths:
+                bare = sp.split(":", 1)[-1] if ":" in sp else sp
+                fname = Path(bare).name
+                rows = conn.execute(
+                    "SELECT table_name FROM _tabular_meta WHERE source_file = ?",
+                    (fname,),
+                ).fetchall()
+                for (tbl,) in rows:
+                    conn.execute(f"DROP TABLE IF EXISTS [{tbl}]")
+                conn.execute(
+                    "DELETE FROM _tabular_meta WHERE source_file = ?",
+                    (fname,),
+                )
+            conn.commit()
+
+        if not tabular_files:
+            conn.close()
+            return 0
+
+        tables_created = 0
+        for fp in tabular_files:
+            stem = re.sub(r"[^a-z0-9]", "_", fp.stem.lower()).strip("_")
+            try:
+                if fp.suffix.lower() == ".xlsx":
+                    sheets = pd.read_excel(fp, sheet_name=None, engine="openpyxl")
+                else:
+                    sheets = {"csv": pd.read_csv(fp)}
+            except Exception as exc:
+                logger.warning("Tabular ingestion skipped %s: %s", fp.name, exc)
+                continue
+
+            for idx, (sheet_name, df) in enumerate(sheets.items()):
+                if df.empty:
+                    continue
+                table_name = f"t_{stem}_s{idx}"
+
+                # ── Auto-detect real header row ─────────────────────
+                # Excel files often have a title/banner row first
+                # (e.g. "SATCORP SALES DATA SHEET"), making pandas
+                # generate "Unnamed: 0" columns.  Scan the first few
+                # rows for a better header candidate.
+                table_description = ""
+                unnamed_count = sum(
+                    1 for c in df.columns if str(c).startswith("Unnamed")
+                )
+                if unnamed_count > len(df.columns) // 2:
+                    # The first column header (non-Unnamed) is often the
+                    # title/banner text, e.g. "SATCORP SALES DATA SHEET"
+                    for c in df.columns:
+                        cstr = str(c).strip()
+                        if cstr and not cstr.startswith("Unnamed"):
+                            table_description = cstr
+                            break
+                    for try_row in range(min(5, len(df))):
+                        row_vals = df.iloc[try_row]
+                        non_null_str = sum(
+                            1
+                            for v in row_vals
+                            if pd.notna(v)
+                            and isinstance(v, str)
+                            and v.strip()
+                        )
+                        if non_null_str >= len(df.columns) * 0.6:
+                            # Promote this row to header
+                            df.columns = [
+                                str(v).strip() if pd.notna(v) else f"col_{i}"
+                                for i, v in enumerate(row_vals)
+                            ]
+                            df = df.iloc[try_row + 1 :].reset_index(drop=True)
+                            break
+
+                # ── Sanitize column names to be SQL-safe ────────────
+                rename_map = {}
+                seen: set[str] = set()
+                for col in df.columns:
+                    clean = re.sub(r"[^a-z0-9]+", "_", str(col).lower().strip())
+                    clean = clean.strip("_") or "col"
+                    if clean[0].isdigit():
+                        clean = f"col_{clean}"
+                    base = clean
+                    i = 2
+                    while clean in seen:
+                        clean = f"{base}_{i}"
+                        i += 1
+                    seen.add(clean)
+                    rename_map[col] = clean
+                df = df.rename(columns=rename_map)
+
+                # Drop columns where every value is NaN (empty index cols)
+                df = df.dropna(axis=1, how="all")
+                # Drop rows where every column is NaN (title/spacer rows)
+                df = df.dropna(how="all")
+                if df.empty:
+                    continue
+
+                # Coerce columns that look numeric to actual numeric dtype
+                for col in df.columns:
+                    converted = pd.to_numeric(df[col], errors="coerce")
+                    if converted.notna().sum() >= df[col].notna().sum() * 0.8:
+                        df[col] = converted
+
+                conn.execute(f"DROP TABLE IF EXISTS [{table_name}]")
+                conn.execute(
+                    "DELETE FROM _tabular_meta WHERE table_name = ?",
+                    (table_name,),
+                )
+
+                df.to_sql(table_name, conn, if_exists="replace", index=False)
+
+                col_info = {}
+                for col in df.columns:
+                    dtype = str(df[col].dtype)
+                    if "int" in dtype:
+                        col_info[str(col)] = "INTEGER"
+                    elif "float" in dtype:
+                        col_info[str(col)] = "REAL"
+                    else:
+                        col_info[str(col)] = "TEXT"
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO _tabular_meta "
+                    "(table_name, source_file, sheet_name, description, "
+                    "columns_json, row_count, ingested_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        table_name,
+                        fp.name,
+                        str(sheet_name),
+                        table_description,
+                        json.dumps(col_info),
+                        len(df),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                tables_created += 1
+
+            # Free dataframes before processing next file
+            del sheets
+            _release_memory()
+
+        conn.commit()
+        conn.close()
+        logger.info(
+            "Tabular ingestion: %d tables created in %s", tables_created, db_path
+        )
+        return tables_created
 
     def close(self) -> None:
         """Release resources held by the pipeline."""
