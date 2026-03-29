@@ -30,16 +30,19 @@ On stronger hardware the pipeline scales up with a few parameter changes:
 
 ## Features
 
-- **Multimodal ingestion** — PDF, DOCX, XLSX, EML, images (PNG/JPG/TIFF/BMP), and plain text (TXT, MD, CSV, JSON, XML, HTML)
+- **Query router** — LLM-based classifier routes each question as *structured* (analytical/tabular) or *unstructured* (knowledge), dispatching to the SQL agent or RAG pipeline accordingly
+- **Text-to-SQL data agent** — generates SQL from natural language, executes safely against a read-only SQLite connection, formats results via LLM, and automatically retries with relaxed filters on empty results
+- **Tabular ingestion** — XLSX and CSV files are loaded into SQLite (`data/tabular.db`) with auto-detected header rows, sanitized column names, and numeric type coercion via pandas
+- **Multimodal document ingestion** — PDF, DOCX, XLSX, EML, images (PNG/JPG/TIFF/BMP), and plain text (TXT, MD, CSV, JSON, XML, HTML)
 - **Azure Blob Storage ingestion** — ingest documents directly from an Azure container; blobs are downloaded, parsed, and indexed with a single API call or dashboard button
-- **Scanned document OCR** — RapidOCR (ONNX Runtime) with fast gating and text-density probing for PDFs
-- **Hybrid retrieval** — BM25 keyword + semantic vector + filename lookup + proper-noun phrase matching, merged via Reciprocal Rank Fusion
+- **Scanned document OCR** — RapidOCR (ONNX Runtime) with fast gating, text-density probing, reduced DPI/resolution limits, and `malloc_trim` to return freed heap pages to the OS
+- **Hybrid retrieval** — BM25 keyword + semantic vector + filename lookup + proper-noun phrase matching, merged via Reciprocal Rank Fusion; optional `source_filter` to restrict results by ingestion source
 - **Cross-encoder reranking** — multilingual mmarco-mMiniLMv2-L12-H384-v1 refines top results for precision
 - **Citations on every result** — filename, page number, and text snippet
-- **Incremental processing** — SQLite state DB with MD5 change detection; never reprocesses unchanged files, resumes from failures
-- **Memory-safe on 16 GB RAM** — two-phase pipeline, model swapping (unload embedder for OCR and vice versa), batch commits, `gc.collect()` checkpoints
+- **Incremental processing** — SQLite state DB with MD5 change detection; source-prefixed keys keep LOCAL and Azure records independent across resyncs
+- **Memory-safe on 16 GB RAM** — two-phase pipeline, model swapping, batch commits, `gc.collect()` checkpoints, and subprocess isolation of the sync worker to reduce import overhead from ~300 MB to ~2 MB
 - **RAGAS evaluation** — automated golden dataset generation, Faithfulness / Context Precision / Answer Relevancy scoring, ingestion throughput and query latency benchmarks
-- **Production API + dashboard** — FastAPI REST endpoints and Streamlit researcher dashboard with chat interface
+- **Production API + dashboard** — FastAPI REST endpoints with thread-safe singleton retriever, and Streamlit researcher dashboard with streaming chat interface
 
 ## Architecture
 
@@ -58,26 +61,21 @@ Documents on disk (data/)  ─or─  Azure Blob Storage
  │        |                        |                            │
  │        └──────────┬─────────────┘                            │
  │                   ▼                                          │
- │          BatchCommitter ──► ChromaDB (HNSW cosine)           │
- │    paraphrase-multilingual-MiniLM-L12-v2 embeddings (ONNX)  │
+ │  BatchCommitter ──► ChromaDB       Tabular loader ──► SQLite │
+ │  (HNSW cosine embeddings)          (XLSX/CSV → tabular.db)   │
  └──────────────────────────────────────────────────────────────┘
                      |
                      v
  ┌─────────────────────────────────────────────────────┐
- │            Hybrid Retriever                          │
- │  Semantic search (ChromaDB cosine)                   │
- │  + BM25 keyword search (BM25Okapi)                   │
- │  + Filename / proper-noun phrase search              │
- │  ──► Reciprocal Rank Fusion ──► Cross-encoder rerank │
- │  ──► Citations (filename, page, snippet)             │
- └─────────────────────────────────────────────────────┘
-                     |
-                     v
- ┌─────────────────────────────────────────────────────┐
- │           Answer Generation                          │
- │  Top-5 chunks as context ──► Ollama (Llama 3.2)      │
- │  Research-assistant prompt ──► Cited answer           │
- └─────────────────────────────────────────────────────┘
+ │              Query Router (LLM classifier)           │
+ │  "structured" ──► Text-to-SQL   "unstructured" ──►  │
+ │    Data Agent        │           Hybrid Retriever    │
+ │    (SQLite query)    │     Semantic + BM25 + RRF     │
+ │         |            │     + Cross-encoder rerank    │
+ │         v            │              |                │
+ │    LLM formatting    │              v                │
+ │                      │     RAG answer generation     │
+ └──────────────────────┴──────────────────────────────┘
                      |
                      v
  ┌─────────────────────────────────────────────────────┐
@@ -92,13 +90,16 @@ Documents on disk (data/)  ─or─  Azure Blob Storage
 | Component | Technology | Details |
 |-----------|-----------|---------|
 | LLM | Ollama + Llama 3.2 | 3b (dev) / 8b (eval), local CPU inference |
+| Query Router | Ollama LLM classifier | Routes structured (SQL) vs unstructured (RAG) queries |
+| Text-to-SQL | Custom data agent | NL → SQL generation, safe execution, LLM-formatted results |
 | Embeddings | paraphrase-multilingual-MiniLM-L12-v2 | 384-dim, multilingual, ONNX-accelerated with PyTorch fallback |
 | Vector DB | ChromaDB | HNSW index, cosine similarity, persistent disk mode |
+| Tabular DB | SQLite (`data/tabular.db`) | Auto-ingested XLSX/CSV with pandas, header detection, type coercion |
 | OCR | RapidOCR | ONNX Runtime, replaces Tesseract for 3-10x speed |
 | PDF Parsing | PyMuPDF | Native text extraction + 300 DPI rendering for scanned pages |
 | Keyword Search | BM25Okapi | Pickled to disk, auto-refreshed after ingestion |
 | Reranker | cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 | Multilingual query-document pair scoring |
-| API | FastAPI | Background sync, health checks, query endpoint |
+| API | FastAPI | Background sync, health checks, query + streaming endpoints |
 | Dashboard | Streamlit | Chat interface, citation viewer, ingestion progress |
 | State Tracking | SQLite | MD5 hashing, incremental processing, resume-on-failure |
 | Cloud Storage (optional) | Azure Blob Storage | `azure-storage-blob>=12.0`, on-demand download |
@@ -231,8 +232,9 @@ localvaultrag/
 │   ├── config.py               # Pydantic Settings (reads .env)
 │   ├── models.py               # FileRecord, ParseResult, ParsingStatus
 │   ├── parser.py               # Multimodal parsers (PDF, DOCX, XLSX, EML, OCR, text)
-│   ├── pipeline.py             # Two-phase ingestion orchestrator + BatchCommitter
-│   └── state_tracker.py        # SQLite state DB with MD5 change detection
+│   ├── pipeline.py             # Two-phase ingestion orchestrator + BatchCommitter + tabular loader
+│   ├── state_tracker.py        # SQLite state DB with MD5 change detection
+│   └── sync_worker.py          # Import-light subprocess worker (prevents OOM)
 ├── vector_db/
 │   └── retriever.py            # Hybrid retriever (BM25 + semantic + reranking)
 ├── evals/
@@ -248,6 +250,7 @@ localvaultrag/
 │   └── test_azure_ingestion.py # Azure Blob Storage ingestion tests
 ├── data/                       # Runtime data (gitignored)
 │   ├── chroma/                 # ChromaDB persistent index + BM25 pickle
+│   ├── tabular.db              # SQLite tabular database (auto-ingested XLSX/CSV)
 │   ├── state.db                # SQLite state database
 │   └── test_docs/              # Generated test documents
 ├── .devcontainer/
@@ -273,7 +276,23 @@ The pipeline runs in two phases to stay within 16 GB RAM:
 
 2. **Phase 2 (OCR formats):** Scanned PDFs and images are processed sequentially with a single worker. The embedding model is unloaded to free ~300 MB before OCR begins, and ORC models (~400 MB) are unloaded before reloading the embedder.
 
-The SQLite state tracker records an MD5 hash for every file. On subsequent runs, unchanged files are skipped, and previously failed files are retried automatically.
+The SQLite state tracker records an MD5 hash for every file. On subsequent runs, unchanged files are skipped, and previously failed files are retried automatically. The sync worker runs in a dedicated subprocess with minimal imports to avoid pulling ~300 MB of API dependencies into the child process.
+
+After vector ingestion, a **tabular loader** scans XLSX and CSV files and loads each sheet/file into SQLite (`data/tabular.db`). Header rows are auto-detected by scanning for non-"Unnamed" column labels, column names are sanitized to valid SQL identifiers, and numeric columns are coerced via `pd.to_numeric`.
+
+### Query Router
+
+Each incoming question is classified by the LLM as *structured* (analytical/tabular) or *unstructured* (knowledge/document). Structured questions are dispatched to the Text-to-SQL data agent; unstructured questions follow the hybrid retrieval + RAG path. If the SQL agent returns no results, the system falls back to RAG automatically.
+
+### Text-to-SQL Data Agent
+
+For structured queries the agent:
+
+1. Reads the SQLite schema from `tabular.db`
+2. Asks the LLM to generate a `SELECT` statement
+3. Executes the SQL on a read-only connection
+4. If the result is empty, retries with relaxed WHERE filters
+5. Formats the result rows via the LLM into a natural-language answer
 
 ### Hybrid Retrieval
 
@@ -302,6 +321,7 @@ All settings are managed via environment variables (see [`.env.example`](.env.ex
 | `EMBEDDING_MODEL` | `paraphrase-multilingual-MiniLM-L12-v2` | Sentence-transformer model (`.env.example` overrides to `all-MiniLM-L6-v2`) |
 | `CHROMA_PERSIST_PATH` | `data/chroma` | ChromaDB storage directory |
 | `STATE_DB_PATH` | `data/state.db` | SQLite state database path |
+| `TABULAR_DB_PATH` | `data/tabular.db` | SQLite database for ingested XLSX/CSV tables |
 | `MAX_WORKERS` | `2` | Parallel workers for fast-format parsing |
 | `APP_ENV` | `development` | Application environment |
 | `INGESTION_SOURCE` | `LOCAL` | Document source: `LOCAL` or `AZURE` |
@@ -325,15 +345,15 @@ Run the full test suite:
 pytest
 ```
 
-95 tests cover parsing, chunking, pipeline orchestration, state tracking, retrieval, answer generation, and Azure ingestion (unit + integration):
+97 tests cover parsing, chunking, pipeline orchestration, state tracking, retrieval, answer generation, and Azure ingestion (unit + integration):
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
-| `test_retriever.py` | 31 | Pydantic models, RRF, BM25 tokenizer, regex patterns, integration |
+| `test_retriever.py` | 31 | Pydantic models, RRF, BM25 tokenizer, regex patterns, source filtering, integration |
 | `test_azure_ingestion.py` | 19 | Azure settings, blob download, pipeline Azure dispatch |
 | `test_state_tracker.py` | 17 | MD5 hashing, DB init, CRUD, resume logic, summaries |
 | `test_parser.py` | 13 | Text splitting, TextParser, parse_file dispatcher |
-| `test_generate_answer.py` | 8 | Prompt construction, LLM settings passthrough, score filtering |
+| `test_generate_answer.py` | 10 | Prompt construction, LLM settings passthrough, score filtering, query routing |
 | `test_pipeline.py` | 7 | BatchCommitter batching, file discovery, IngestionStats |
 
 > **Note:** Integration tests in `test_retriever.py` require a populated ChromaDB at `data/chroma/`.

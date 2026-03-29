@@ -440,9 +440,7 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
                 escaped = json.dumps(token)
                 yield f"event: token\ndata: {escaped}\n\n"
         else:
-            for token in _stream_answer(
-                request.question, llm_chunks or relevant[:1]
-            ):
+            for token in _stream_answer(request.question, llm_chunks or relevant[:1]):
                 escaped = json.dumps(token)
                 yield f"event: token\ndata: {escaped}\n\n"
 
@@ -542,7 +540,11 @@ def _get_tabular_schema() -> str | None:
         col_str = ", ".join(f"{name} ({dtype})" for name, dtype in cols.items())
         sheet_info = f", sheet: {row['sheet_name']}" if row["sheet_name"] else ""
         desc = row["description"]
-        desc_info = f"\n  Description: {desc} — ALL rows belong to this dataset." if desc else ""
+        desc_info = (
+            f"\n  Description: {desc} — ALL rows belong to this dataset."
+            if desc
+            else ""
+        )
         block = (
             f"Table: {row['table_name']} "
             f"(source: {row['source_file']}{sheet_info}, "
@@ -559,12 +561,9 @@ def _get_tabular_schema() -> str | None:
                 col_names = list(cols.keys())
                 header = " | ".join(col_names)
                 sample_lines = [
-                    " | ".join(str(s[c]) for c in col_names)
-                    for s in sample
+                    " | ".join(str(s[c]) for c in col_names) for s in sample
                 ]
-                block += f"\n  Sample rows:\n  {header}\n  " + "\n  ".join(
-                    sample_lines
-                )
+                block += f"\n  Sample rows:\n  {header}\n  " + "\n  ".join(sample_lines)
         except Exception:
             pass
         parts.append(block)
@@ -672,9 +671,7 @@ def _execute_sql_safely(sql: str) -> list[dict]:
 
     try:
         cursor = conn.execute(cleaned)
-        columns = (
-            [desc[0] for desc in cursor.description] if cursor.description else []
-        )
+        columns = [desc[0] for desc in cursor.description] if cursor.description else []
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
     finally:
         conn.close()
@@ -734,9 +731,7 @@ def _format_sql_result(question: str, sql: str, rows: list[dict]) -> str:
     return resp.json().get("message", {}).get("content", "")
 
 
-def _stream_sql_result(
-    question: str, sql: str, rows: list[dict]
-) -> Iterator[str]:
+def _stream_sql_result(question: str, sql: str, rows: list[dict]) -> Iterator[str]:
     """Stream a natural-language answer from SQL results, token by token."""
     result_text = json.dumps(rows[:50], default=str, ensure_ascii=False)
     if len(rows) > 50:
@@ -963,9 +958,7 @@ def _generate_answer(question: str, results: list[RetrievalResult]) -> str:
         return f"(LLM unavailable: {exc})"
 
 
-def _stream_answer(
-    question: str, results: list[RetrievalResult]
-) -> Iterator[str]:
+def _stream_answer(question: str, results: list[RetrievalResult]) -> Iterator[str]:
     """Stream an LLM answer token-by-token from Ollama.
 
     Yields:
