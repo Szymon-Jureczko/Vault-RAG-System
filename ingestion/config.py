@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     # ── State DB ────────────────────────────────────────────────────────────
     state_db_path: Path = Path("data/state.db")
 
+    # ── Tabular DB (SQLite for Text-to-SQL agent) ─────────────────────────
+    tabular_db_path: Path = Path("data/tabular.db")
+
     # ── Concurrency ─────────────────────────────────────────────────────────
     max_workers: int = (
         2  # non-OCR parsers; reduced to leave RAM for larger multilingual embedder
