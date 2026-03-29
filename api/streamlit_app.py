@@ -17,7 +17,6 @@ API_BASE = "http://localhost:8000"
 
 st.set_page_config(
     page_title="LocalVaultRAG — Researcher Dashboard",
-    page_icon="🔒",
     layout="wide",
 )
 
@@ -204,11 +203,11 @@ if question := st.chat_input("Ask a question about your documents..."):
                     continue
                 line = raw_line
                 if line.startswith("event:"):
-                    event_type = line[len("event:"):].strip()
+                    event_type = line[len("event:") :].strip()
                     continue
                 if not line.startswith("data:"):
                     continue
-                data_str = line[len("data:"):].strip()
+                data_str = line[len("data:") :].strip()
 
                 if event_type == "citations":
                     results_data = json.loads(data_str)
@@ -229,11 +228,7 @@ if question := st.chat_input("Ask a question about your documents..."):
                 with st.expander("Citations & Sources"):
                     for r in results_data:
                         c = r["citation"]
-                        page_str = (
-                            f", Page {c['page']}"
-                            if c.get("page")
-                            else ""
-                        )
+                        page_str = f", Page {c['page']}" if c.get("page") else ""
                         st.markdown(
                             f"**{c['filename']}**"
                             f"{page_str} "
@@ -253,8 +248,7 @@ if question := st.chat_input("Ask a question about your documents..."):
 
         except requests.ConnectionError:
             err = (
-                "Cannot connect to API server. "
-                "Start it with: `uvicorn api.main:app`"
+                "Cannot connect to API server. " "Start it with: `uvicorn api.main:app`"
             )
             st.error(err)
             st.session_state.messages.append(
