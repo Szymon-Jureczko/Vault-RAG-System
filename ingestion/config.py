@@ -116,6 +116,9 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.0
     llm_num_thread: int = 8
 
+    # ── Structured (Text-to-SQL) agent ───────────────────────────────────────
+    structured_top_k: int = 10
+
     @field_validator("ingestion_source", mode="before")
     @classmethod
     def _normalise_ingestion_source(cls, v: object) -> str:

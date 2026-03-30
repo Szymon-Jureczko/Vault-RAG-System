@@ -505,7 +505,87 @@ def _classify_query(question: str) -> str:
     return "unstructured"
 
 
-def _get_tabular_schema() -> str | None:
+def _filter_relevant_tables(
+    question: str, top_k: int | None = None
+) -> list[str] | None:
+    """Pre-filter tables by BM25 relevance to the user's question.
+
+    Args:
+        question: The user's natural-language question.
+        top_k: Number of tables to return.  Defaults to
+            ``settings.structured_top_k``.
+
+    Returns:
+        List of table_name strings, or ``None`` if no tabular data exists.
+    """
+    import sqlite3
+
+    from rank_bm25 import BM25Okapi
+
+    if top_k is None:
+        top_k = settings.structured_top_k
+
+    db_path = settings.tabular_db_path
+    if not db_path.exists():
+        return None
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT table_name, source_file, sheet_name, description, "
+            "columns_json FROM _tabular_meta"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+
+    if len(rows) <= top_k:
+        return [row["table_name"] for row in rows]
+
+    # Build one "document" per table from its metadata
+    docs: list[list[str]] = []
+    table_names: list[str] = []
+    for row in rows:
+        cols = json.loads(row["columns_json"])
+        col_names = " ".join(cols.keys())
+        text = " ".join(
+            filter(
+                None,
+                [
+                    row["description"],
+                    row["source_file"],
+                    row["sheet_name"],
+                    col_names,
+                ],
+            )
+        )
+        docs.append(re.findall(r"\w+", text.lower()))
+        table_names.append(row["table_name"])
+
+    bm25 = BM25Okapi(docs)
+    query_tokens = re.findall(r"\w+", question.lower())
+    scores = bm25.get_scores(query_tokens)
+
+    top_indices = sorted(
+        range(len(scores)), key=lambda i: scores[i], reverse=True
+    )[:top_k]
+
+    result = [table_names[i] for i in top_indices]
+    logger.info(
+        "Table pre-filter: %d/%d tables selected (top scores: %s)",
+        len(result),
+        len(table_names),
+        ", ".join(f"{scores[i]:.2f}" for i in top_indices[:3]),
+    )
+    return result
+
+
+def _get_tabular_schema(table_names: list[str] | None = None) -> str | None:
     """Read the tabular metadata table and build a schema prompt block.
 
     Returns:
@@ -521,11 +601,21 @@ def _get_tabular_schema() -> str | None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            "SELECT table_name, source_file, sheet_name, description, "
-            "columns_json, row_count FROM _tabular_meta "
-            "ORDER BY source_file, table_name"
-        ).fetchall()
+        if table_names:
+            placeholders = ",".join("?" for _ in table_names)
+            rows = conn.execute(
+                "SELECT table_name, source_file, sheet_name, description, "
+                "columns_json, row_count FROM _tabular_meta "
+                f"WHERE table_name IN ({placeholders}) "
+                "ORDER BY source_file, table_name",
+                table_names,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT table_name, source_file, sheet_name, description, "
+                "columns_json, row_count FROM _tabular_meta "
+                "ORDER BY source_file, table_name"
+            ).fetchall()
     except sqlite3.OperationalError:
         conn.close()
         return None
@@ -622,7 +712,7 @@ def _generate_sql(question: str, schema: str) -> str:
     resp = httpx.post(
         f"{settings.ollama_base_url}/api/chat",
         json=payload,
-        timeout=30.0,
+        timeout=settings.llm_timeout,
     )
     resp.raise_for_status()
     raw = resp.json().get("message", {}).get("content", "").strip()
@@ -793,7 +883,8 @@ def _handle_structured_query(question: str) -> str:
     Returns:
         Natural language answer, or ``""`` on failure (signals RAG fallback).
     """
-    schema = _get_tabular_schema()
+    relevant_tables = _filter_relevant_tables(question)
+    schema = _get_tabular_schema(table_names=relevant_tables)
     if not schema:
         return ""
 
@@ -834,7 +925,8 @@ def _handle_structured_query_stream(question: str) -> Iterator[str] | None:
     Returns:
         Iterator of tokens, or ``None`` to signal fallback to RAG.
     """
-    schema = _get_tabular_schema()
+    relevant_tables = _filter_relevant_tables(question)
+    schema = _get_tabular_schema(table_names=relevant_tables)
     if not schema:
         return None
 
