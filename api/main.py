@@ -367,7 +367,20 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     logger.info("Router classified %r as %s", request.question[:80], query_type)
 
     if query_type == "structured":
-        answer = _handle_structured_query(request.question)
+        answer, scored_tables = _handle_structured_query(request.question)
+        if answer and scored_tables:
+            result_items = [
+                QueryResultOut(
+                    text=c["text"],
+                    score=c["score"],
+                    citation=CitationOut(
+                        filename=c["citation"]["filename"],
+                        page=c["citation"]["page"],
+                        snippet=c["citation"]["snippet"],
+                    ),
+                )
+                for c in _build_table_citations(scored_tables)
+            ]
 
     # Fallback to RAG if structured agent returned nothing, or if unstructured
     if not answer and relevant:
@@ -428,7 +441,11 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
 
     sql_stream: Iterator[str] | None = None
     if query_type == "structured":
-        sql_stream = _handle_structured_query_stream(request.question)
+        stream_result = _handle_structured_query_stream(request.question)
+        if stream_result is not None:
+            sql_stream, scored_tables = stream_result
+            if scored_tables:
+                result_items = _build_table_citations(scored_tables)
 
     def event_generator() -> Iterator[str]:
         # 1. Send citations immediately so the UI can show them
@@ -507,7 +524,7 @@ def _classify_query(question: str) -> str:
 
 def _filter_relevant_tables(
     question: str, top_k: int | None = None
-) -> list[str] | None:
+) -> list[tuple[str, float]] | None:
     """Pre-filter tables by BM25 relevance to the user's question.
 
     Args:
@@ -516,7 +533,8 @@ def _filter_relevant_tables(
             ``settings.structured_top_k``.
 
     Returns:
-        List of table_name strings, or ``None`` if no tabular data exists.
+        List of ``(table_name, normalised_score)`` tuples sorted by
+        relevance, or ``None`` if no tabular data exists.
     """
     import sqlite3
 
@@ -545,7 +563,7 @@ def _filter_relevant_tables(
         return None
 
     if len(rows) <= top_k:
-        return [row["table_name"] for row in rows]
+        return [(row["table_name"], 1.0) for row in rows]
 
     # Build one "document" per table from its metadata
     docs: list[list[str]] = []
@@ -575,7 +593,14 @@ def _filter_relevant_tables(
         range(len(scores)), key=lambda i: scores[i], reverse=True
     )[:top_k]
 
-    result = [table_names[i] for i in top_indices]
+    # Normalise scores to 0.0–1.0
+    max_score = scores[top_indices[0]] if top_indices else 1.0
+    if max_score <= 0:
+        max_score = 1.0
+
+    result = [
+        (table_names[i], scores[i] / max_score) for i in top_indices
+    ]
     logger.info(
         "Table pre-filter: %d/%d tables selected (top scores: %s)",
         len(result),
@@ -585,8 +610,15 @@ def _filter_relevant_tables(
     return result
 
 
-def _get_tabular_schema(table_names: list[str] | None = None) -> str | None:
+def _get_tabular_schema(
+    scored_tables: list[tuple[str, float]] | None = None,
+) -> str | None:
     """Read the tabular metadata table and build a schema prompt block.
+
+    Args:
+        scored_tables: Optional list of ``(table_name, score)`` tuples
+            from :func:`_filter_relevant_tables`.  When provided only
+            these tables are included.
 
     Returns:
         Schema description string, or ``None`` if no tabular data exists.
@@ -601,14 +633,15 @@ def _get_tabular_schema(table_names: list[str] | None = None) -> str | None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
-        if table_names:
-            placeholders = ",".join("?" for _ in table_names)
+        if scored_tables:
+            names = [t[0] for t in scored_tables]
+            placeholders = ",".join("?" for _ in names)
             rows = conn.execute(
                 "SELECT table_name, source_file, sheet_name, description, "
                 "columns_json, row_count FROM _tabular_meta "
                 f"WHERE table_name IN ({placeholders}) "
                 "ORDER BY source_file, table_name",
-                table_names,
+                names,
             ).fetchall()
         else:
             rows = conn.execute(
@@ -877,16 +910,86 @@ def _sql_result_is_empty(rows: list[dict]) -> bool:
     return False
 
 
-def _handle_structured_query(question: str) -> str:
+def _build_table_citations(
+    scored_tables: list[tuple[str, float]],
+) -> list[dict]:
+    """Build citation dicts for structured query source tables.
+
+    Produces the same ``{text, score, citation: {filename, page, snippet}}``
+    shape used by unstructured retrieval so the UI renders them identically.
+    """
+    import sqlite3
+
+    if not scored_tables:
+        return []
+
+    db_path = settings.tabular_db_path
+    if not db_path.exists():
+        return []
+
+    score_map = dict(scored_tables)
+    names = [t[0] for t in scored_tables]
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in names)
+        rows = conn.execute(
+            "SELECT table_name, source_file, sheet_name, description, "
+            "columns_json FROM _tabular_meta "
+            f"WHERE table_name IN ({placeholders})",
+            names,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+    # Deduplicate by source_file — keep the sheet with the highest score
+    best_per_file: dict[str, dict] = {}
+    for row in rows:
+        fname = row["source_file"]
+        tname = row["table_name"]
+        score = score_map.get(tname, 0.0)
+        cols = json.loads(row["columns_json"])
+        col_list = ", ".join(f"{c} ({t})" for c, t in cols.items())
+        sheet = row["sheet_name"]
+        desc = row["description"] or ""
+
+        snippet_parts = []
+        if sheet:
+            snippet_parts.append(f"Sheet: {sheet}")
+        if desc:
+            snippet_parts.append(desc)
+        snippet_parts.append(f"Columns: {col_list}")
+        snippet = "\n".join(snippet_parts)
+
+        if fname not in best_per_file or score > best_per_file[fname]["score"]:
+            best_per_file[fname] = {
+                "text": desc,
+                "score": round(score, 3),
+                "citation": {
+                    "filename": fname,
+                    "page": None,
+                    "snippet": snippet,
+                },
+            }
+
+    result = sorted(best_per_file.values(), key=lambda x: x["score"], reverse=True)
+    return result
+
+
+def _handle_structured_query(question: str) -> tuple[str, list[tuple[str, float]] | None]:
     """Execute the full Text-to-SQL data agent pipeline (non-streaming).
 
     Returns:
-        Natural language answer, or ``""`` on failure (signals RAG fallback).
+        ``(answer, scored_tables)`` — answer is ``""`` on failure (signals
+        RAG fallback).
     """
     relevant_tables = _filter_relevant_tables(question)
-    schema = _get_tabular_schema(table_names=relevant_tables)
+    schema = _get_tabular_schema(scored_tables=relevant_tables)
     if not schema:
-        return ""
+        return "", relevant_tables
 
     try:
         sql = _generate_sql(question, schema)
@@ -894,7 +997,7 @@ def _handle_structured_query(question: str) -> str:
         rows = _execute_sql_safely(sql)
 
         if rows and "error" in rows[0] and rows[0]["error"] == "NOT_ANSWERABLE":
-            return ""
+            return "", relevant_tables
 
         # Retry once if the result is empty — the model likely added a
         # spurious WHERE clause.
@@ -911,22 +1014,24 @@ def _handle_structured_query(question: str) -> str:
             rows = _execute_sql_safely(sql)
 
         if _sql_result_is_empty(rows):
-            return ""
+            return "", relevant_tables
 
-        return _format_sql_result(question, sql, rows)
+        return _format_sql_result(question, sql, rows), relevant_tables
     except Exception as exc:
         logger.warning("Structured query agent failed: %s", exc)
-        return ""
+        return "", relevant_tables
 
 
-def _handle_structured_query_stream(question: str) -> Iterator[str] | None:
+def _handle_structured_query_stream(
+    question: str,
+) -> tuple[Iterator[str], list[tuple[str, float]] | None] | None:
     """Execute the Text-to-SQL data agent pipeline (streaming).
 
     Returns:
-        Iterator of tokens, or ``None`` to signal fallback to RAG.
+        ``(token_iterator, scored_tables)`` or ``None`` to signal fallback.
     """
     relevant_tables = _filter_relevant_tables(question)
-    schema = _get_tabular_schema(table_names=relevant_tables)
+    schema = _get_tabular_schema(scored_tables=relevant_tables)
     if not schema:
         return None
 
@@ -954,7 +1059,7 @@ def _handle_structured_query_stream(question: str) -> Iterator[str] | None:
         if _sql_result_is_empty(rows):
             return None
 
-        return _stream_sql_result(question, sql, rows)
+        return _stream_sql_result(question, sql, rows), relevant_tables
     except Exception as exc:
         logger.warning("Structured query agent failed: %s", exc)
         return None
