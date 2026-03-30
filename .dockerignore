@@ -6,8 +6,20 @@ __pycache__
 *.pyc
 *.pyo
 data/
-evals/results.json
 .env
 *.egg-info
 .pytest_cache
 .mypy_cache
+
+# Dev / test / docs — not needed in production image
+tests/
+evals/
+notebooks/
+docs/
+scripts/
+requirements-dev.txt
+pyproject.toml
+pyrightconfig.json
+.flake8
+.copilotignore
+*.md

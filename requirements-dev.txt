@@ -1,0 +1,14 @@
+# Dev / test / evaluation dependencies — NOT needed in production.
+# Install with:  pip install -r requirements-dev.txt
+-r requirements.txt
+
+# ── Evaluation ──────────────────────────────────────────────────────────────
+ragas>=0.1
+datasets>=2.18
+
+# ── Dev / Notebook ──────────────────────────────────────────────────────────
+jupyterlab>=4.0
+ipykernel>=6.0
+
+# ── Testing ─────────────────────────────────────────────────────────────────
+pytest>=8.0

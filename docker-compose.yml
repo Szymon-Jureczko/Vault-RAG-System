@@ -1,6 +1,7 @@
 services:
   app:
     build: .
+    image: rag-app:latest
     ports:
       - "8000:8000"
     volumes:
@@ -14,6 +15,7 @@ services:
       - path: .env
         required: false
     mem_limit: 6g
+    restart: unless-stopped
     networks:
       - ragsystem
     depends_on:
@@ -21,16 +23,23 @@ services:
         condition: service_started
 
   dashboard:
-    build: .
-    ports:
-      - "8501:8501"
-    environment:
-      - PYTHONPATH=/app
-    command: ["streamlit", "run", "api/streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
-    networks:
-      - ragsystem
+    image: rag-app:latest
     depends_on:
       - app
+    ports:
+      - "8501:8501"
+    volumes:
+      - app-data:/app/data
+    environment:
+      - PYTHONPATH=/app
+      - OLLAMA_BASE_URL=http://ollama:11434
+    env_file:
+      - path: .env
+        required: false
+    command: ["streamlit", "run", "api/streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+    restart: unless-stopped
+    networks:
+      - ragsystem
 
   ollama:
     image: ollama/ollama:latest

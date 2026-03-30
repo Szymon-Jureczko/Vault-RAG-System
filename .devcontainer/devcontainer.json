@@ -65,5 +65,5 @@
   },
   // Install Python deps, then pull the dev model into Ollama via its REST API.
   // The pull is idempotent — safe to re-run if layers are already cached.
-  "postCreateCommand": "pip install -r requirements.txt && curl -sf http://ollama:11434/api/pull -d '{\"name\":\"llama3.2:3b\"}' || true"
+  "postCreateCommand": "pip install -r requirements-dev.txt && curl -sf http://ollama:11434/api/pull -d '{\"name\":\"llama3.2:3b\"}' || true"
 }

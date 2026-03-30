@@ -1,7 +1,6 @@
 FROM python:3.12-bookworm
 
 # System dependencies
-# - tesseract-ocr + language packs for OCR processing
 # - libgl1 / libglib2.0-0 for PyMuPDF / OpenCV
 # - sqlite3 for state_db CLI access
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -10,11 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     vim \
     build-essential \
-    libpq-dev \
-    # Tesseract OCR
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    libtesseract-dev \
     # PyMuPDF / image processing
     libgl1 \
     libglib2.0-0 \
