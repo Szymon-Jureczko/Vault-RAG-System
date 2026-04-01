@@ -167,12 +167,14 @@ def generate_golden_dataset(
         except Exception as exc:
             logger.warning(
                 "Failed to generate question from %s: %s",
-                filename, exc,
+                filename,
+                exc,
             )
 
     logger.info(
         "Generated %d golden questions from %d files",
-        len(questions), len(file_texts),
+        len(questions),
+        len(file_texts),
     )
     return questions
 
@@ -193,16 +195,34 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
         List of EvalResult instances.
     """
     try:
+        from openai import AsyncOpenAI
         from datasets import Dataset
         from ragas import evaluate
-        from ragas.metrics import (
-            answer_relevancy,
-            context_precision,
-            faithfulness,
-        )
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        from ragas.llms import llm_factory
+        from ragas.metrics._answer_relevance import AnswerRelevancy
+        from ragas.metrics._context_precision import ContextPrecision
+        from ragas.metrics._faithfulness import Faithfulness
+        from ragas.run_config import RunConfig
     except ImportError:
         logger.error("RAGAS not installed. Run: pip install ragas datasets")
         return _fallback_evaluate(questions)
+
+    # Use local Ollama via its OpenAI-compatible endpoint
+    client = AsyncOpenAI(
+        api_key="ollama",
+        base_url=f"{settings.ollama_base_url}/v1",
+    )
+    judge_llm = llm_factory(
+        settings.ollama_model_eval, provider="openai", client=client,
+    )
+    judge_embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+
+    metrics = [
+        Faithfulness(llm=judge_llm),
+        ContextPrecision(llm=judge_llm),
+        AnswerRelevancy(llm=judge_llm, embeddings=judge_embeddings, strictness=1),
+    ]
 
     # Collect RAG responses
     rows = {"question": [], "answer": [], "contexts": [], "ground_truth": []}
@@ -219,9 +239,7 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
 
             rows["question"].append(q.question)
             rows["answer"].append(data.get("answer", ""))
-            rows["contexts"].append(
-                [r["text"] for r in data.get("results", [])]
-            )
+            rows["contexts"].append([r["text"] for r in data.get("results", [])])
             rows["ground_truth"].append(q.ground_truth)
         except Exception as exc:
             logger.warning("Query failed for '%s': %s", q.question, exc)
@@ -234,10 +252,20 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
 
     result = evaluate(
         dataset,
-        metrics=[faithfulness, context_precision, answer_relevancy],
+        metrics=metrics,
+        run_config=RunConfig(
+            timeout=600,
+            max_retries=1,
+            max_wait=5,
+            max_workers=1,
+        ),
+        raise_exceptions=False,
     )
 
     eval_results = []
+    faith_scores = result["faithfulness"]
+    cp_scores = result["context_precision"]
+    ar_scores = result["answer_relevancy"]
     for i, q in enumerate(questions):
         eval_results.append(
             EvalResult(
@@ -245,9 +273,9 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
                 answer=rows["answer"][i],
                 contexts=rows["contexts"][i],
                 ground_truth=q.ground_truth,
-                faithfulness=result.get("faithfulness", 0.0),
-                context_precision=result.get("context_precision", 0.0),
-                answer_relevancy=result.get("answer_relevancy", 0.0),
+                faithfulness=faith_scores[i] if faith_scores[i] is not None else 0.0,
+                context_precision=cp_scores[i] if cp_scores[i] is not None else 0.0,
+                answer_relevancy=ar_scores[i] if ar_scores[i] is not None else 0.0,
             )
         )
 
@@ -285,9 +313,7 @@ def _fallback_evaluate(questions: list[GoldenQuestion]) -> list[EvalResult]:
             )
         except Exception as exc:
             logger.warning("Fallback query failed: %s", exc)
-            results.append(
-                EvalResult(question=q.question, ground_truth=q.ground_truth)
-            )
+            results.append(EvalResult(question=q.question, ground_truth=q.ground_truth))
     return results
 
 
@@ -311,12 +337,29 @@ def benchmark_ingestion(data_dir: str = "data/") -> BenchmarkResult:
             timeout=600,
         )
         resp.raise_for_status()
-        stats = resp.json()["stats"]
+        data = resp.json()
+        job_id = data.get("job_id")
+        stats = data.get("stats")
+
+        # POST /sync is async; poll until complete if we got a job_id.
+        if job_id and stats is None:
+            for _ in range(120):  # up to 10 minutes
+                time.sleep(5)
+                poll = httpx.get(f"{API_BASE}/sync/{job_id}", timeout=30)
+                poll.raise_for_status()
+                poll_data = poll.json()
+                status = poll_data.get("status", "")
+                if status == "completed" or status.startswith("failed"):
+                    stats = poll_data.get("stats")
+                    break
     except Exception as exc:
         logger.error("Ingestion benchmark failed: %s", exc)
         return BenchmarkResult()
 
     elapsed = time.perf_counter() - start
+    if stats is None:
+        logger.error("Ingestion benchmark: no stats returned")
+        return BenchmarkResult()
     total = stats.get("total_discovered", 0)
     fpm = (total / elapsed) * 60 if elapsed > 0 else 0
 
@@ -364,19 +407,25 @@ def main() -> None:
     """Run the full evaluation and benchmarking suite."""
     parser = argparse.ArgumentParser(description="RAGAS Evaluation Suite")
     parser.add_argument(
-        "--data-dir", default="data/",
+        "--data-dir",
+        default="data/",
         help="Document source directory",
     )
     parser.add_argument(
-        "--sample-size", type=int, default=50,
+        "--sample-size",
+        type=int,
+        default=50,
         help="Max docs to sample",
     )
     parser.add_argument(
-        "--questions", type=int, default=20,
+        "--questions",
+        type=int,
+        default=20,
         help="Golden questions to generate",
     )
     parser.add_argument(
-        "--output", default="evals/results.json",
+        "--output",
+        default="evals/results.json",
         help="Output file path",
     )
     args = parser.parse_args()
@@ -386,7 +435,9 @@ def main() -> None:
     # Step 1: Generate golden dataset
     logger.info("Generating golden dataset...")
     golden = generate_golden_dataset(
-        data_dir, args.sample_size, args.questions,
+        data_dir,
+        args.sample_size,
+        args.questions,
     )
 
     if not golden:
@@ -396,9 +447,7 @@ def main() -> None:
     # Save golden dataset
     golden_path = Path("evals/golden_dataset.json")
     golden_path.parent.mkdir(parents=True, exist_ok=True)
-    golden_path.write_text(
-        json.dumps([q.model_dump() for q in golden], indent=2)
-    )
+    golden_path.write_text(json.dumps([q.model_dump() for q in golden], indent=2))
     logger.info("Golden dataset saved to %s", golden_path)
 
     # Step 2: RAGAS evaluation
@@ -430,15 +479,9 @@ def main() -> None:
     # Summary
     if eval_results:
         n = len(eval_results)
-        avg_faith = sum(
-            r.faithfulness for r in eval_results
-        ) / n
-        avg_prec = sum(
-            r.context_precision for r in eval_results
-        ) / n
-        avg_rel = sum(
-            r.answer_relevancy for r in eval_results
-        ) / n
+        avg_faith = sum(r.faithfulness for r in eval_results) / n
+        avg_prec = sum(r.context_precision for r in eval_results) / n
+        avg_rel = sum(r.answer_relevancy for r in eval_results) / n
         print(f"\n{'='*50}")
         print("RAGAS Evaluation Summary")
         print(f"{'='*50}")

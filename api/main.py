@@ -589,18 +589,16 @@ def _filter_relevant_tables(
     query_tokens = re.findall(r"\w+", question.lower())
     scores = bm25.get_scores(query_tokens)
 
-    top_indices = sorted(
-        range(len(scores)), key=lambda i: scores[i], reverse=True
-    )[:top_k]
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
+        :top_k
+    ]
 
     # Normalise scores to 0.0–1.0
     max_score = scores[top_indices[0]] if top_indices else 1.0
     if max_score <= 0:
         max_score = 1.0
 
-    result = [
-        (table_names[i], scores[i] / max_score) for i in top_indices
-    ]
+    result = [(table_names[i], scores[i] / max_score) for i in top_indices]
     logger.info(
         "Table pre-filter: %d/%d tables selected (top scores: %s)",
         len(result),
@@ -979,7 +977,9 @@ def _build_table_citations(
     return result
 
 
-def _handle_structured_query(question: str) -> tuple[str, list[tuple[str, float]] | None]:
+def _handle_structured_query(
+    question: str,
+) -> tuple[str, list[tuple[str, float]] | None]:
     """Execute the full Text-to-SQL data agent pipeline (non-streaming).
 
     Returns:

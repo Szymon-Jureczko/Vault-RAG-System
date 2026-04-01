@@ -197,8 +197,11 @@ class TestGenerateAnswerSettings:
 
 
 class TestSettingsNewFields:
-    def test_new_fields_have_correct_defaults(self) -> None:
+    def test_new_fields_have_correct_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """llm_num_ctx / llm_num_predict / llm_timeout must have safe defaults."""
+        monkeypatch.delenv("LLM_NUM_PREDICT", raising=False)
         s = Settings(_env_file=None)  # type: ignore[call-arg]
         assert s.llm_num_ctx == 6144
         assert s.llm_num_predict == 768
