@@ -56,8 +56,8 @@ class Settings(BaseSettings):
             greedy decoding, which is faster and more factually consistent for
             RAG question-answering.
         llm_num_thread: Number of CPU threads for Ollama inference.  Defaults to
-            8 to match the i5-1135G7 logical core count.  Explicitly set because
-            Docker ``mem_limit`` can sometimes confuse auto-detection.
+            4 to match the i5-1135G7 physical core count.  Hyperthreading adds
+            overhead for LLM inference, so we use physical cores only.
         chunk_overlap: Character overlap between consecutive text chunks.
             400 chars keeps bibliography entries and section boundaries whole
             across chunk splits.  Re-ingestion is required after changing this.
@@ -71,7 +71,7 @@ class Settings(BaseSettings):
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     ollama_base_url: str = "http://ollama:11434"
-    ollama_model_dev: str = "llama3.2:3b"
+    ollama_model_dev: str = "llama3.2:3b-instruct-q4_K_M"
     ollama_model_eval: str = "llama3.2:8b"
 
     # ── Embeddings ──────────────────────────────────────────────────────────
@@ -96,7 +96,8 @@ class Settings(BaseSettings):
     batch_commit_size: int = 50
 
     # ── Chunking ─────────────────────────────────────────────────────────────
-    chunk_overlap: int = 400
+    chunk_size: int = 800
+    chunk_overlap: int = 150
 
     # ── App ──────────────────────────────────────────────────────────────────
     app_env: str = "development"
@@ -114,9 +115,10 @@ class Settings(BaseSettings):
     llm_num_predict: int = 768
     llm_timeout: float = 120.0
     llm_temperature: float = 0.0
-    llm_num_thread: int = 8
+    llm_num_thread: int = 4
 
-    # ── Structured (Text-to-SQL) agent ───────────────────────────────────────
+    # ── Evaluation ───────────────────────────────────────────────────────────
+    openai_api_key: str = ""
     structured_top_k: int = 10
 
     @field_validator("ingestion_source", mode="before")

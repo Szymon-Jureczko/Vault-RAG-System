@@ -87,7 +87,7 @@ def _split_text(
     chunk_size: int,
     parser_name: str,
     page: int | None = None,
-    overlap: int = 200,
+    overlap: int = 150,
 ) -> list[Chunk]:
     """Split text into fixed-size chunks with metadata.
 
@@ -181,7 +181,9 @@ class DocxParser(BaseParser):
     def extensions(self) -> set[str]:
         return OFFICE_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+    def parse(
+        self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 150
+    ) -> ParserResult:
         """Parse DOCX using python-docx.
 
         Args:
@@ -219,7 +221,9 @@ class DocxParser(BaseParser):
                     parts.append("\n".join(rows))
 
             full_text = "\n\n".join(parts)
-            chunks = _split_text(full_text, path, chunk_size, self.name)
+            chunks = _split_text(
+                full_text, path, chunk_size, self.name, overlap=chunk_overlap
+            )
             return ParserResult(
                 file_path=str(path),
                 chunks=chunks,
@@ -251,7 +255,9 @@ class PyMuPDFParser(BaseParser):
     def extensions(self) -> set[str]:
         return PDF_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 2000) -> ParserResult:
+    def parse(
+        self, path: Path, chunk_size: int = 2000, chunk_overlap: int = 150
+    ) -> ParserResult:
         """Extract text from PDF pages using PyMuPDF (fitz).
 
         Args:
@@ -280,7 +286,7 @@ class PyMuPDFParser(BaseParser):
                     page_num = i + 1
                     text = str(page.get_text())
                     page_chunks = _split_text(
-                        text, path, chunk_size, self.name, page=page_num
+                        text, path, chunk_size, self.name, page=page_num, overlap=chunk_overlap
                     )
                     all_chunks.extend(page_chunks)
                 page_count = len(doc)
@@ -322,7 +328,9 @@ class ScannedPDFParser(BaseParser):
     def extensions(self) -> set[str]:
         return PDF_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 2000) -> ParserResult:
+    def parse(
+        self, path: Path, chunk_size: int = 2000, chunk_overlap: int = 150
+    ) -> ParserResult:
         """Extract text from a scanned PDF via page-level OCR.
 
         Args:
@@ -392,6 +400,7 @@ class ScannedPDFParser(BaseParser):
                         chunk_size,
                         self.name,
                         page=page_num,
+                        overlap=chunk_overlap,
                     )
                     all_chunks.extend(page_chunks)
 
@@ -442,7 +451,9 @@ class RapidOCRParser(BaseParser):
     def extensions(self) -> set[str]:
         return IMAGE_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+    def parse(
+        self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 150
+    ) -> ParserResult:
         """Extract text from an image using RapidOCR.
 
         Args:
@@ -508,7 +519,7 @@ class RapidOCRParser(BaseParser):
             result, _ = self._get_engine()(ocr_arr)
             del ocr_arr  # free numpy array immediately
             text = "\n".join(line[1] for line in result) if result else ""
-            chunks = _split_text(text, path, chunk_size, self.name, page=1)
+            chunks = _split_text(text, path, chunk_size, self.name, page=1, overlap=chunk_overlap)
 
             return ParserResult(
                 file_path=str(path),
@@ -541,7 +552,7 @@ class TextParser(BaseParser):
     def extensions(self) -> set[str]:
         return TEXT_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+    def parse(self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 150) -> ParserResult:
         """Read and chunk plain-text files.
 
         Args:
@@ -553,7 +564,7 @@ class TextParser(BaseParser):
         """
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
-            chunks = _split_text(text, path, chunk_size, self.name)
+            chunks = _split_text(text, path, chunk_size, self.name, overlap=chunk_overlap)
 
             return ParserResult(
                 file_path=str(path),
@@ -586,7 +597,7 @@ class OpenpyxlParser(BaseParser):
     def extensions(self) -> set[str]:
         return XLSX_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+    def parse(self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 150) -> ParserResult:
         try:
             from openpyxl import load_workbook
         except ImportError as exc:
@@ -610,7 +621,7 @@ class OpenpyxlParser(BaseParser):
             wb.close()
 
             full_text = "\n\n".join(parts)
-            chunks = _split_text(full_text, path, chunk_size, self.name)
+            chunks = _split_text(full_text, path, chunk_size, self.name, overlap=chunk_overlap)
             return ParserResult(
                 file_path=str(path),
                 chunks=chunks,
@@ -642,7 +653,7 @@ class EmlParser(BaseParser):
     def extensions(self) -> set[str]:
         return EML_EXTENSIONS
 
-    def parse(self, path: Path, chunk_size: int = 1000) -> ParserResult:
+    def parse(self, path: Path, chunk_size: int = 1000, chunk_overlap: int = 150) -> ParserResult:
         """Extract headers and body text from an EML file.
 
         Args:
@@ -675,7 +686,7 @@ class EmlParser(BaseParser):
                     parts.append(payload.decode(charset, errors="replace"))
 
             full_text = "\n\n".join(parts)
-            chunks = _split_text(full_text, path, chunk_size, self.name)
+            chunks = _split_text(full_text, path, chunk_size, self.name, overlap=chunk_overlap)
             return ParserResult(
                 file_path=str(path),
                 chunks=chunks,
@@ -741,7 +752,11 @@ for _p in _PARSERS:
 SUPPORTED_EXTENSIONS = set(_EXT_MAP.keys()) | PDF_EXTENSIONS
 
 
-def parse_file(path: Path, chunk_size: int = 2000) -> ParserResult:
+def parse_file(
+    path: Path,
+    chunk_size: int = 2000,
+    chunk_overlap: int = 150,
+) -> ParserResult:
     """Parse a file using the best available parser.
 
     PDFs are routed via a cheap text-density probe:
@@ -753,6 +768,7 @@ def parse_file(path: Path, chunk_size: int = 2000) -> ParserResult:
     Args:
         path: Path to the source document.
         chunk_size: Approximate characters per chunk.
+        chunk_overlap: Characters of overlap between consecutive chunks.
 
     Returns:
         ParserResult from the matched parser.
@@ -774,4 +790,4 @@ def parse_file(path: Path, chunk_size: int = 2000) -> ParserResult:
             error=f"Unsupported extension: {ext}",
         )
     logger.info("Parsing %s with %s", path.name, parser.name)
-    return parser.parse(path, chunk_size=chunk_size)
+    return parser.parse(path, chunk_size=chunk_size, chunk_overlap=chunk_overlap)

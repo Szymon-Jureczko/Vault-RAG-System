@@ -39,6 +39,11 @@ logging.getLogger("azure").setLevel(logging.WARNING)
 # chunk at ingestion time, so it is not duplicated in the LLM prompt.
 _SOURCE_PREFIX_RE = re.compile(r"^\[Source:[^\]]*\]\n")
 
+# Minimum content length (after stripping [Source:] prefix) for a chunk to
+# be worth sending to the LLM.  Short fragments like "lbf.", "=\n+" waste
+# context slots and dilute the signal, hurting answer relevancy.
+_MIN_CHUNK_CONTENT_LEN = 50
+
 app = FastAPI(
     title="LocalVaultRAG",
     description="Privacy-first enterprise RAG — 100% local inference",
@@ -344,9 +349,9 @@ def query_documents(request: QueryRequest) -> QueryResponse:
         source_filter=request.ingestion_source,
     )
 
-    # Filter to chunks the cross-encoder considers relevant (score > 0).
-    # Negative-score chunks are not useful as citations or LLM context.
-    relevant = [r for r in results if r.score > 0] or results[:1]
+    # Filter to chunks the cross-encoder considers relevant (score > 0.3).
+    # Low-score chunks add noise that degrades LLM answer quality.
+    relevant = [r for r in results if r.score > 0.3] or results[:1]
 
     result_items = [
         QueryResultOut(
@@ -367,7 +372,7 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     logger.info("Router classified %r as %s", request.question[:80], query_type)
 
     if query_type == "structured":
-        answer, scored_tables = _handle_structured_query(request.question)
+        answer, scored_tables, sql_rows = _handle_structured_query(request.question)
         if answer and scored_tables:
             result_items = [
                 QueryResultOut(
@@ -381,11 +386,32 @@ def query_documents(request: QueryRequest) -> QueryResponse:
                 )
                 for c in _build_table_citations(scored_tables)
             ]
+            # Prepend the raw SQL rows as a context item so RAGAS faithfulness
+            # can verify the answer against the actual data values.
+            if sql_rows:
+                data_text = json.dumps(sql_rows[:20], default=str, ensure_ascii=False)
+                result_items.insert(
+                    0,
+                    QueryResultOut(
+                        text=data_text,
+                        score=1.0,
+                        citation=CitationOut(
+                            filename=scored_tables[0][0],
+                            page=None,
+                            snippet=data_text[:300],
+                        ),
+                    ),
+                )
 
     # Fallback to RAG if structured agent returned nothing, or if unstructured
     if not answer and relevant:
         top_score = relevant[0].score
-        llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
+        llm_chunks = [
+            r
+            for r in relevant[:7]
+            if r.score >= top_score * 0.85
+            and len(_SOURCE_PREFIX_RE.sub("", r.text).strip()) >= _MIN_CHUNK_CONTENT_LEN
+        ]
         answer = _generate_answer(request.question, llm_chunks or relevant[:1])
 
     return QueryResponse(
@@ -417,7 +443,7 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
         source_filter=request.ingestion_source,
     )
 
-    relevant = [r for r in results if r.score > 0] or results[:1]
+    relevant = [r for r in results if r.score > 0.3] or results[:1]
 
     result_items = [
         {
@@ -433,7 +459,12 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
     ]
 
     top_score = relevant[0].score if relevant else 0
-    llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
+    llm_chunks = [
+        r
+        for r in relevant[:7]
+        if r.score >= top_score * 0.85
+        and len(_SOURCE_PREFIX_RE.sub("", r.text).strip()) >= _MIN_CHUNK_CONTENT_LEN
+    ]
 
     # ── Query Router: structured (SQL) vs unstructured (RAG) ────────
     query_type = _classify_query(request.question)
@@ -658,22 +689,22 @@ def _get_tabular_schema(
     parts = []
     for row in rows:
         cols = json.loads(row["columns_json"])
-        col_str = ", ".join(f"{name} ({dtype})" for name, dtype in cols.items())
         sheet_info = f", sheet: {row['sheet_name']}" if row["sheet_name"] else ""
         desc = row["description"]
-        desc_info = (
-            f"\n  Description: {desc} — ALL rows belong to this dataset."
-            if desc
-            else ""
+
+        comment_lines = [
+            f"-- source: {row['source_file']}{sheet_info}, {row['row_count']} rows"
+        ]
+        if desc:
+            comment_lines.append(f"-- {desc}")
+
+        col_defs = [f'  "{name}" {dtype.upper()}' for name, dtype in cols.items()]
+        create_stmt = (
+            f'CREATE TABLE "{row["table_name"]}" (\n' + ",\n".join(col_defs) + "\n);"
         )
-        block = (
-            f"Table: {row['table_name']} "
-            f"(source: {row['source_file']}{sheet_info}, "
-            f"{row['row_count']} rows)"
-            f"{desc_info}\n"
-            f"  Columns: {col_str}"
-        )
-        # Include sample rows so the LLM understands actual data values
+        block = "\n".join(comment_lines) + "\n" + create_stmt
+
+        # Append sample rows as SQL comments so the LLM sees real values
         try:
             sample = conn.execute(
                 f"SELECT * FROM \"{row['table_name']}\" LIMIT 3"
@@ -684,7 +715,9 @@ def _get_tabular_schema(
                 sample_lines = [
                     " | ".join(str(s[c]) for c in col_names) for s in sample
                 ]
-                block += f"\n  Sample rows:\n  {header}\n  " + "\n  ".join(sample_lines)
+                block += f"\n-- Sample rows:\n-- {header}\n-- " + "\n-- ".join(
+                    sample_lines
+                )
         except Exception:
             pass
         parts.append(block)
@@ -714,9 +747,19 @@ def _generate_sql(question: str, schema: str) -> str:
                     "Do not wrap it in markdown code fences.\n\n"
                     f"Schema:\n{schema}\n\n"
                     "Rules:\n"
-                    "- Use only tables and columns shown above.\n"
+                    "- CRITICAL: Use ONLY the exact table names and column "
+                    "names defined in the CREATE TABLE statements above. "
+                    "Never invent, guess, or abbreviate a column name.\n"
+                    "- If the answer needs a column that is not in the schema, "
+                    "reply: SELECT 'NOT_ANSWERABLE' AS error;\n"
                     "- SQLite syntax only.\n"
                     "- Always wrap column and table names in double quotes.\n"
+                    "- String values in WHERE clauses must use single quotes "
+                    "only: WHERE \"col\" = 'value'. Never wrap string values "
+                    "in double quotes.\n"
+                    "- Prefer a single-table query; only JOIN when you are "
+                    "certain both tables share an exact matching key column "
+                    "visible in the schema above.\n"
                     "- IMPORTANT: Each table already contains ALL rows for "
                     "its dataset. Do NOT add a WHERE clause to filter by a "
                     "company name, dataset name, or source name. Only use "
@@ -979,17 +1022,18 @@ def _build_table_citations(
 
 def _handle_structured_query(
     question: str,
-) -> tuple[str, list[tuple[str, float]] | None]:
+) -> tuple[str, list[tuple[str, float]] | None, list[dict]]:
     """Execute the full Text-to-SQL data agent pipeline (non-streaming).
 
     Returns:
-        ``(answer, scored_tables)`` — answer is ``""`` on failure (signals
-        RAG fallback).
+        ``(answer, scored_tables, sql_rows)`` — answer is ``""`` on failure
+        (signals RAG fallback).  sql_rows contains the raw result rows so
+        callers can include them as context for evaluation.
     """
     relevant_tables = _filter_relevant_tables(question)
     schema = _get_tabular_schema(scored_tables=relevant_tables)
     if not schema:
-        return "", relevant_tables
+        return "", relevant_tables, []
 
     try:
         sql = _generate_sql(question, schema)
@@ -997,7 +1041,7 @@ def _handle_structured_query(
         rows = _execute_sql_safely(sql)
 
         if rows and "error" in rows[0] and rows[0]["error"] == "NOT_ANSWERABLE":
-            return "", relevant_tables
+            return "", relevant_tables, []
 
         # Retry once if the result is empty — the model likely added a
         # spurious WHERE clause.
@@ -1014,12 +1058,12 @@ def _handle_structured_query(
             rows = _execute_sql_safely(sql)
 
         if _sql_result_is_empty(rows):
-            return "", relevant_tables
+            return "", relevant_tables, []
 
-        return _format_sql_result(question, sql, rows), relevant_tables
+        return _format_sql_result(question, sql, rows), relevant_tables, rows
     except Exception as exc:
         logger.warning("Structured query agent failed: %s", exc)
-        return "", relevant_tables
+        return "", relevant_tables, [], []
 
 
 def _handle_structured_query_stream(
@@ -1091,26 +1135,20 @@ def _build_llm_payload(
     )
 
     system_prompt = (
-        "You are a study assistant that answers ONLY from the provided "
-        "context. You have NO knowledge of your own — treat the context as "
-        "your only source of truth.\n\n"
-        "STRICT RULES:\n"
-        "1. Use ONLY facts that are explicitly stated in the context. Never "
-        "add information from outside the context, even if you know it.\n"
-        "2. If the context does not contain enough information to answer "
-        'the question, say: "The provided documents do not contain enough '
-        'information to answer this question."\n'
-        "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
-        "4. SYNTHESIZE information across ALL provided sources into one "
-        "coherent answer — do not just parrot or summarise a single "
-        "source. Merge overlapping ideas, resolve redundancies, and "
-        "combine unique details from each source. If two sources say "
-        "the same thing in different words, state the idea ONCE in your "
-        "own words. Start with a clear definition, then explain key "
-        "details, categories, applications, or examples. Aim for a "
-        "comprehensive response that adds value beyond any single "
-        "source alone.\n"
-        "5. Do NOT add citations or source references — they are handled "
+        "You are a precise document assistant. Answer the question using "
+        "ONLY the provided context.\n\n"
+        "RULES:\n"
+        "1. Use ONLY facts from the context. Do not add outside knowledge.\n"
+        "2. Extract and synthesize information — look for answers in "
+        "headings, footers, author lines, slide titles, metadata, and "
+        "inline references, not just body paragraphs.\n"
+        "3. If the context partially answers the question, provide what "
+        'you can find. Only say "Information not found in the provided '
+        'documents." if the context truly contains NOTHING relevant.\n'
+        "4. ALWAYS answer in the SAME LANGUAGE as the question.\n"
+        "5. Be concise and direct. Answer the question first, then "
+        "elaborate only if needed.\n"
+        "6. Do NOT add citations or source references — they are handled "
         "separately."
     )
 

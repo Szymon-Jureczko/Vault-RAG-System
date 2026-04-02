@@ -6,7 +6,11 @@ Files-Per-Minute ingestion throughput and Query Latency.
 
 Usage::
 
-    python -m evals.ragas_suite --data-dir data/ \\
+    python -m evals.ragas_suite --data-dir data/test_docs/ \\
+        --sample-size 50 --questions 20
+
+    # Use Azure blob container as document source:
+    python -m evals.ragas_suite --source azure \\
         --sample-size 50 --questions 20
 """
 
@@ -15,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
+import os
 import time
 from pathlib import Path
 
@@ -24,6 +30,12 @@ from pydantic import BaseModel, Field
 from ingestion.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Suppress Azure SDK's verbose HTTP transport logs
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
+    logging.WARNING
+)
+logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
 API_BASE = "http://localhost:8000"
@@ -122,12 +134,18 @@ def generate_golden_dataset(
     # Extract text from each file
     file_texts: list[tuple[str, str]] = []
     for fp in files:
-        result = parse_file(fp, chunk_size=2000)
+        result = parse_file(fp, chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
         if result.success and result.chunks:
             text = result.chunks[0].text[:1500]
             file_texts.append((fp.name, text))
 
     questions: list[GoldenQuestion] = []
+
+    # Use OpenAI for question generation when API key is available
+    openai_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY", "")
+    use_openai = bool(openai_key)
+    if use_openai:
+        logger.info("Using OpenAI for golden question generation")
 
     for filename, text in file_texts:
         if len(questions) >= num_questions:
@@ -135,23 +153,38 @@ def generate_golden_dataset(
 
         prompt = (
             "Generate a factual question and answer based on this document "
-            "excerpt. Return ONLY valid JSON: "
+            "excerpt. The question must be complete, well-formed, and in the "
+            "same language as the excerpt. Return ONLY valid JSON: "
             '{"question": "...", "answer": "..."}\n\n'
             f"Document: {filename}\n\nExcerpt:\n{text}\n\nJSON:"
         )
 
         try:
-            resp = httpx.post(
-                f"{settings.ollama_base_url}/api/generate",
-                json={
-                    "model": settings.ollama_model_dev,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
+            if use_openai:
+                resp = httpx.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.0,
+                    },
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"]
+            else:
+                resp = httpx.post(
+                    f"{settings.ollama_base_url}/api/generate",
+                    json={
+                        "model": settings.ollama_model_dev,
+                        "prompt": prompt,
+                        "stream": False,
+                    },
+                    timeout=60.0,
+                )
+                resp.raise_for_status()
+                raw = resp.json().get("response", "")
             # Extract JSON from response
             start = raw.find("{")
             end = raw.rfind("}") + 1
@@ -198,7 +231,7 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
         from openai import AsyncOpenAI
         from datasets import Dataset
         from ragas import evaluate
-        from langchain_community.embeddings import HuggingFaceEmbeddings
+        from langchain_huggingface import HuggingFaceEmbeddings
         from ragas.llms import llm_factory
         from ragas.metrics._answer_relevance import AnswerRelevancy
         from ragas.metrics._context_precision import ContextPrecision
@@ -208,14 +241,22 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
         logger.error("RAGAS not installed. Run: pip install ragas datasets")
         return _fallback_evaluate(questions)
 
-    # Use local Ollama via its OpenAI-compatible endpoint
-    client = AsyncOpenAI(
-        api_key="ollama",
-        base_url=f"{settings.ollama_base_url}/v1",
-    )
-    judge_llm = llm_factory(
-        settings.ollama_model_eval, provider="openai", client=client,
-    )
+    # Prefer OpenAI for the judge LLM when an API key is available;
+    # fall back to local Ollama otherwise.
+    openai_key = settings.openai_api_key
+    if openai_key:
+        logger.info("Using OpenAI judge LLM (gpt-4o-mini)")
+        client = AsyncOpenAI(api_key=openai_key)
+        judge_llm = llm_factory("gpt-4o-mini", provider="openai", client=client)
+    else:
+        logger.info("Using Ollama judge LLM (%s)", settings.ollama_model_eval)
+        client = AsyncOpenAI(
+            api_key="ollama",
+            base_url=f"{settings.ollama_base_url}/v1",
+        )
+        judge_llm = llm_factory(
+            settings.ollama_model_eval, provider="openai", client=client,
+        )
     judge_embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
 
     metrics = [
@@ -232,7 +273,7 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
             resp = httpx.post(
                 f"{API_BASE}/query",
                 json={"question": q.question, "top_k": 5},
-                timeout=120,
+                timeout=300,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -273,9 +314,9 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
                 answer=rows["answer"][i],
                 contexts=rows["contexts"][i],
                 ground_truth=q.ground_truth,
-                faithfulness=faith_scores[i] if faith_scores[i] is not None else 0.0,
-                context_precision=cp_scores[i] if cp_scores[i] is not None else 0.0,
-                answer_relevancy=ar_scores[i] if ar_scores[i] is not None else 0.0,
+                faithfulness=faith_scores[i] if faith_scores[i] is not None and not math.isnan(faith_scores[i]) else 0.0,
+                context_precision=cp_scores[i] if cp_scores[i] is not None and not math.isnan(cp_scores[i]) else 0.0,
+                answer_relevancy=ar_scores[i] if ar_scores[i] is not None and not math.isnan(ar_scores[i]) else 0.0,
             )
         )
 
@@ -320,7 +361,7 @@ def _fallback_evaluate(questions: list[GoldenQuestion]) -> list[EvalResult]:
 # ── Benchmarking ───────────────────────────────────────────────────────────
 
 
-def benchmark_ingestion(data_dir: str = "data/") -> BenchmarkResult:
+def benchmark_ingestion(data_dir: str = "data/test_docs/") -> BenchmarkResult:
     """Measure ingestion throughput (Files-Per-Minute).
 
     Args:
@@ -403,13 +444,55 @@ def benchmark_queries(questions: list[GoldenQuestion]) -> BenchmarkResult:
 # ── CLI entrypoint ─────────────────────────────────────────────────────────
 
 
+def _resolve_azure_data_dir() -> Path:
+    """Download blobs from Azure to the local staging path and return it.
+
+    Validates that the required Azure settings are configured, creates the
+    staging directory if absent, then delegates to ``download_azure_blobs``.
+
+    Returns:
+        Path to the local staging directory containing the downloaded blobs.
+
+    Raises:
+        SystemExit: If Azure credentials or container name are not configured.
+    """
+    from ingestion.pipeline import download_azure_blobs
+
+    if not settings.azure_storage_connection_string:
+        logger.error(
+            "AZURE_STORAGE_CONNECTION_STRING must be set for --source azure"
+        )
+        raise SystemExit(1)
+    if not settings.azure_container_name:
+        logger.error("AZURE_CONTAINER_NAME must be set for --source azure")
+        raise SystemExit(1)
+
+    staging = settings.azure_staging_path
+    staging.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Downloading blobs from container '%s' to %s ...",
+        settings.azure_container_name,
+        staging,
+    )
+    count = download_azure_blobs(staging)
+    logger.info("Downloaded %d blob(s) from Azure", count)
+    return staging
+
+
 def main() -> None:
     """Run the full evaluation and benchmarking suite."""
     parser = argparse.ArgumentParser(description="RAGAS Evaluation Suite")
     parser.add_argument(
+        "--source",
+        choices=["local", "azure"],
+        default="local",
+        help="Document source: 'local' (default) or 'azure' (downloads from blob storage)",
+    )
+    parser.add_argument(
         "--data-dir",
-        default="data/",
-        help="Document source directory",
+        default="data/test_docs/",
+        help="Document source directory (local source only)",
     )
     parser.add_argument(
         "--sample-size",
@@ -430,7 +513,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    data_dir = Path(args.data_dir)
+    if args.source == "azure":
+        data_dir = _resolve_azure_data_dir()
+    else:
+        data_dir = Path(args.data_dir)
 
     # Step 1: Generate golden dataset
     logger.info("Generating golden dataset...")

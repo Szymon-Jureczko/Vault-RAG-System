@@ -37,9 +37,7 @@ logger = logging.getLogger(__name__)
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 
 
-def _extract_relevant_snippet(
-    text: str, query: str, max_len: int = 500
-) -> str:
+def _extract_relevant_snippet(text: str, query: str, max_len: int = 500) -> str:
     """Return the most query-relevant window of *text*, up to *max_len* chars.
 
     Uses a sliding-window approach scored by keyword overlap with the query.
@@ -78,9 +76,7 @@ def _extract_relevant_snippet(
     for i in range(0, len(words), step):
         start_char = word_starts[i]
         end_char = min(start_char + max_len, len(clean))
-        window_words = {
-            w.lower() for w in _WORD_RE.findall(clean[start_char:end_char])
-        }
+        window_words = {w.lower() for w in _WORD_RE.findall(clean[start_char:end_char])}
         score = len(query_words & window_words)
         if score > best_score:
             best_score = score
@@ -391,13 +387,14 @@ class HybridRetriever:
     @staticmethod
     def _reciprocal_rank_fusion(
         *result_lists: list[tuple[str, str, dict, float]],
-        k: int = 60,
+        k: int = 40,
     ) -> list[tuple[str, str, dict, float]]:
         """Merge multiple ranked lists using Reciprocal Rank Fusion.
 
         Args:
             result_lists: Variable number of ranked result lists.
-            k: RRF constant (default 60, per original paper).
+            k: RRF constant (default 40, lowered from 60 to amplify
+                top-result score differences for better precision).
 
         Returns:
             Fused and re-ranked list of results.
@@ -592,13 +589,14 @@ class HybridRetriever:
         bm25_results = self._bm25_search(query_text, bm25_candidates)
 
         # Step 3: Reciprocal Rank Fusion
-        fused = self._reciprocal_rank_fusion(semantic_results, bm25_results)
+        fused = self._reciprocal_rank_fusion(semantic_results, bm25_results, k=40)
 
         # Step 3b: Prepend any chunks for filenames explicitly named in the query
         filename_hits = self._filename_search(query_text)
+        explicit_ids: set[str] = set()
         if filename_hits:
-            seen_ids = {hit[0] for hit in filename_hits}
-            fused = [c for c in fused if c[0] not in seen_ids]
+            explicit_ids.update(h[0] for h in filename_hits)
+            fused = [c for c in fused if c[0] not in explicit_ids]
             candidates = filename_hits + fused
         else:
             candidates = fused
@@ -606,6 +604,7 @@ class HybridRetriever:
         # Step 3c: Append chunks containing proper-noun phrases from the query
         phrase_hits = self._phrase_search(query_text)
         if phrase_hits:
+            explicit_ids.update(h[0] for h in phrase_hits)
             seen_ids = {c[0] for c in candidates}
             candidates += [c for c in phrase_hits if c[0] not in seen_ids]
 
@@ -613,12 +612,16 @@ class HybridRetriever:
         if source_filter:
             _sf = source_filter.lower()
             candidates = [
-                c for c in candidates
-                if c[2].get("ingestion_source", "local") == _sf
+                c for c in candidates if c[2].get("ingestion_source", "local") == _sf
             ]
 
-        # Step 4: Cross-encoder reranking
-        reranked = self._rerank(query_text, candidates, top_k)
+        # Step 4: Cross-encoder reranking.
+        # Always send explicit hits (filename/phrase) to the cross-encoder;
+        # fill remaining slots up to 8 from the top fused results for CPU speed.
+        explicit_cands = [c for c in candidates if c[0] in explicit_ids]
+        fused_cands = [c for c in candidates if c[0] not in explicit_ids]
+        ce_input = explicit_cands + fused_cands[: max(0, 8 - len(explicit_cands))]
+        reranked = self._rerank(query_text, ce_input, top_k)
 
         # Step 5: Build results with citations
         results = []

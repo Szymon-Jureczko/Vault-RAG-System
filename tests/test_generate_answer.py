@@ -155,7 +155,7 @@ class TestGenerateAnswerPrompt:
             m["content"] for m in captured[0]["messages"] if m["role"] == "system"
         )
         assert "ONLY" in system_content
-        assert "do not contain enough information" in system_content.lower()
+        assert "information not found" in system_content.lower()
 
 
 class TestGenerateAnswerSettings:
@@ -207,7 +207,7 @@ class TestSettingsNewFields:
         assert s.llm_num_predict == 768
         assert s.llm_timeout == 120.0
         assert s.llm_temperature == 0.0
-        assert s.llm_num_thread == 8
+        assert s.llm_num_thread == 4
 
     def test_fields_overridable_via_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """LLM_NUM_CTX env var must override the default."""

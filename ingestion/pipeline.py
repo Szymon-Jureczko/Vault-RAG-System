@@ -204,7 +204,7 @@ def _worker(file_path: str, chunk_size: int) -> ParserResult:
     Returns:
         ParserResult from the parser.
     """
-    return parse_file(Path(file_path), chunk_size=chunk_size)
+    return parse_file(Path(file_path), chunk_size=chunk_size, chunk_overlap=settings.chunk_overlap)
 
 
 def discover_files(directory: Path) -> list[Path]:
@@ -300,7 +300,7 @@ def download_azure_blobs(
         try:
             blob_client = container_client.get_blob_client(blob.name)
             with local_path.open("wb") as fh:
-                blob_client.download_blob().readinto(fh)
+                blob_client.download_blob(timeout=60).readinto(fh)
             downloaded += 1
             logger.debug("Downloaded blob: %s -> %s", blob.name, local_path)
         except Exception as exc:
@@ -337,7 +337,7 @@ class IngestionPipeline:
         max_workers: int | None = None,
         ocr_workers: int | None = None,
         batch_size: int = 32,
-        chunk_size: int = 2000,
+        chunk_size: int | None = None,
     ) -> None:
         self._tracker = tracker or StateTracker()
         self._tracker.init_db()
@@ -345,7 +345,7 @@ class IngestionPipeline:
         self._max_workers = max_workers or settings.max_workers
         self._ocr_workers = ocr_workers or settings.ocr_workers
         self._batch_size = batch_size
-        self._chunk_size = chunk_size
+        self._chunk_size = chunk_size if chunk_size is not None else settings.chunk_size
 
     def _init_chroma(self):
         """Initialise ChromaDB collection and embedding function.
@@ -686,14 +686,14 @@ class IngestionPipeline:
             # and LOCAL / AZURE records never collide with each other.
             _src_prefix = f"{eff_source.lower()}:"
             key_map: dict[Path, str] = {
-                fp: _src_prefix + str(fp.relative_to(effective_dir))
-                for fp in all_files
+                fp: _src_prefix + str(fp.relative_to(effective_dir)) for fp in all_files
             }
 
             # ── Purge stale records for deleted files ──────────────────────────
             known_paths = {key_map[fp] for fp in all_files}
             stale_paths = self._tracker.purge_deleted(
-                known_paths, prefix=_src_prefix,
+                known_paths,
+                prefix=_src_prefix,
             )
 
             # ── Filter unchanged ───────────────────────────────────────────────
@@ -891,7 +891,9 @@ class IngestionPipeline:
         )
         # Migration: add description column if it doesn't exist yet
         try:
-            conn.execute("ALTER TABLE _tabular_meta ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "ALTER TABLE _tabular_meta ADD COLUMN description TEXT NOT NULL DEFAULT ''"
+            )
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -955,9 +957,7 @@ class IngestionPipeline:
                         non_null_str = sum(
                             1
                             for v in row_vals
-                            if pd.notna(v)
-                            and isinstance(v, str)
-                            and v.strip()
+                            if pd.notna(v) and isinstance(v, str) and v.strip()
                         )
                         if non_null_str >= len(df.columns) * 0.6:
                             # Promote this row to header
