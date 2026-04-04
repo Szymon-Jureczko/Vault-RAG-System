@@ -13,9 +13,6 @@
         "ms-python.black-formatter",
         "ms-python.isort",
         "ms-python.flake8",
-        // Jupyter
-        "ms-toolsai.jupyter",
-        "ms-toolsai.jupyter-keymap",
         // Env files
         "mikestead.dotenv",
         // Git
@@ -23,8 +20,6 @@
         // YAML / TOML
         "redhat.vscode-yaml",
         "tamasfe.even-better-toml",
-        // Docker
-        "ms-azuretools.vscode-docker",
         // REST client for testing endpoints and Ollama API
         "humao.rest-client",
         // SQLite viewer for state_db inspection
@@ -49,15 +44,11 @@
   },
   "forwardPorts": [
     8000, // FastAPI app server
-    8888, // Jupyter Lab
     11434 // Ollama API
   ],
   "portsAttributes": {
     "8000": {
       "label": "App Server"
-    },
-    "8888": {
-      "label": "Jupyter"
     },
     "11434": {
       "label": "Ollama"
@@ -65,5 +56,5 @@
   },
   // Install Python deps, then pull the dev model into Ollama via its REST API.
   // The pull is idempotent — safe to re-run if layers are already cached.
-  "postCreateCommand": "pip install -r requirements.txt && curl -sf http://ollama:11434/api/pull -d '{\"name\":\"llama3.2:3b\"}' || true"
+  "postCreateCommand": "pip install -r requirements-dev.txt && curl -sf http://ollama:11434/api/pull -d '{\"name\":\"llama3.2:3b\"}' || true"
 }

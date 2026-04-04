@@ -39,6 +39,11 @@ logging.getLogger("azure").setLevel(logging.WARNING)
 # chunk at ingestion time, so it is not duplicated in the LLM prompt.
 _SOURCE_PREFIX_RE = re.compile(r"^\[Source:[^\]]*\]\n")
 
+# Minimum content length (after stripping [Source:] prefix) for a chunk to
+# be worth sending to the LLM.  Short fragments like "lbf.", "=\n+" waste
+# context slots and dilute the signal, hurting answer relevancy.
+_MIN_CHUNK_CONTENT_LEN = 50
+
 app = FastAPI(
     title="LocalVaultRAG",
     description="Privacy-first enterprise RAG — 100% local inference",
@@ -344,9 +349,9 @@ def query_documents(request: QueryRequest) -> QueryResponse:
         source_filter=request.ingestion_source,
     )
 
-    # Filter to chunks the cross-encoder considers relevant (score > 0).
-    # Negative-score chunks are not useful as citations or LLM context.
-    relevant = [r for r in results if r.score > 0] or results[:1]
+    # Filter to chunks the cross-encoder considers relevant (score > 0.3).
+    # Low-score chunks add noise that degrades LLM answer quality.
+    relevant = [r for r in results if r.score > 0.3] or results[:1]
 
     result_items = [
         QueryResultOut(
@@ -364,15 +369,49 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     # ── Query Router: structured (SQL) vs unstructured (RAG) ────────
     answer = ""
     query_type = _classify_query(request.question)
-    logger.info("Router classified %r as %s", request.question[:80], query_type)
+    logger.info("Router classified %r as %s", request.question, query_type)
 
     if query_type == "structured":
-        answer = _handle_structured_query(request.question)
+        answer, scored_tables, sql_rows = _handle_structured_query(request.question)
+        if answer and scored_tables:
+            result_items = [
+                QueryResultOut(
+                    text=c["text"],
+                    score=c["score"],
+                    citation=CitationOut(
+                        filename=c["citation"]["filename"],
+                        page=c["citation"]["page"],
+                        snippet=c["citation"]["snippet"],
+                    ),
+                )
+                for c in _build_table_citations(scored_tables)
+            ]
+            # Prepend the raw SQL rows as a context item so RAGAS faithfulness
+            # can verify the answer against the actual data values.
+            if sql_rows:
+                data_text = json.dumps(sql_rows[:20], default=str, ensure_ascii=False)
+                result_items.insert(
+                    0,
+                    QueryResultOut(
+                        text=data_text,
+                        score=1.0,
+                        citation=CitationOut(
+                            filename=scored_tables[0][0],
+                            page=None,
+                            snippet=data_text[:300],
+                        ),
+                    ),
+                )
 
     # Fallback to RAG if structured agent returned nothing, or if unstructured
     if not answer and relevant:
         top_score = relevant[0].score
-        llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
+        llm_chunks = [
+            r
+            for r in relevant[:7]
+            if r.score >= top_score * 0.85
+            and len(_SOURCE_PREFIX_RE.sub("", r.text).strip()) >= _MIN_CHUNK_CONTENT_LEN
+        ]
         answer = _generate_answer(request.question, llm_chunks or relevant[:1])
 
     return QueryResponse(
@@ -404,7 +443,7 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
         source_filter=request.ingestion_source,
     )
 
-    relevant = [r for r in results if r.score > 0] or results[:1]
+    relevant = [r for r in results if r.score > 0.3] or results[:1]
 
     result_items = [
         {
@@ -420,15 +459,24 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
     ]
 
     top_score = relevant[0].score if relevant else 0
-    llm_chunks = [r for r in relevant[:5] if r.score >= top_score * 0.85]
+    llm_chunks = [
+        r
+        for r in relevant[:7]
+        if r.score >= top_score * 0.85
+        and len(_SOURCE_PREFIX_RE.sub("", r.text).strip()) >= _MIN_CHUNK_CONTENT_LEN
+    ]
 
     # ── Query Router: structured (SQL) vs unstructured (RAG) ────────
     query_type = _classify_query(request.question)
-    logger.info("Router classified %r as %s", request.question[:80], query_type)
+    logger.info("Router classified %r as %s", request.question, query_type)
 
     sql_stream: Iterator[str] | None = None
     if query_type == "structured":
-        sql_stream = _handle_structured_query_stream(request.question)
+        stream_result = _handle_structured_query_stream(request.question)
+        if stream_result is not None:
+            sql_stream, scored_tables = stream_result
+            if scored_tables:
+                result_items = _build_table_citations(scored_tables)
 
     def event_generator() -> Iterator[str]:
         # 1. Send citations immediately so the UI can show them
@@ -505,8 +553,101 @@ def _classify_query(question: str) -> str:
     return "unstructured"
 
 
-def _get_tabular_schema() -> str | None:
+def _filter_relevant_tables(
+    question: str, top_k: int | None = None
+) -> list[tuple[str, float]] | None:
+    """Pre-filter tables by BM25 relevance to the user's question.
+
+    Args:
+        question: The user's natural-language question.
+        top_k: Number of tables to return.  Defaults to
+            ``settings.structured_top_k``.
+
+    Returns:
+        List of ``(table_name, normalised_score)`` tuples sorted by
+        relevance, or ``None`` if no tabular data exists.
+    """
+    import sqlite3
+
+    from rank_bm25 import BM25Okapi
+
+    if top_k is None:
+        top_k = settings.structured_top_k
+
+    db_path = settings.tabular_db_path
+    if not db_path.exists():
+        return None
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT table_name, source_file, sheet_name, description, "
+            "columns_json FROM _tabular_meta"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+
+    if len(rows) <= top_k:
+        return [(row["table_name"], 1.0) for row in rows]
+
+    # Build one "document" per table from its metadata
+    docs: list[list[str]] = []
+    table_names: list[str] = []
+    for row in rows:
+        cols = json.loads(row["columns_json"])
+        col_names = " ".join(cols.keys())
+        text = " ".join(
+            filter(
+                None,
+                [
+                    row["description"],
+                    row["source_file"],
+                    row["sheet_name"],
+                    col_names,
+                ],
+            )
+        )
+        docs.append(re.findall(r"\w+", text.lower()))
+        table_names.append(row["table_name"])
+
+    bm25 = BM25Okapi(docs)
+    query_tokens = re.findall(r"\w+", question.lower())
+    scores = bm25.get_scores(query_tokens)
+
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[
+        :top_k
+    ]
+
+    # Normalise scores to 0.0–1.0
+    max_score = scores[top_indices[0]] if top_indices else 1.0
+    if max_score <= 0:
+        max_score = 1.0
+
+    result = [(table_names[i], scores[i] / max_score) for i in top_indices]
+    logger.info(
+        "Table pre-filter: %d/%d tables selected (top scores: %s)",
+        len(result),
+        len(table_names),
+        ", ".join(f"{scores[i]:.2f}" for i in top_indices[:3]),
+    )
+    return result
+
+
+def _get_tabular_schema(
+    scored_tables: list[tuple[str, float]] | None = None,
+) -> str | None:
     """Read the tabular metadata table and build a schema prompt block.
+
+    Args:
+        scored_tables: Optional list of ``(table_name, score)`` tuples
+            from :func:`_filter_relevant_tables`.  When provided only
+            these tables are included.
 
     Returns:
         Schema description string, or ``None`` if no tabular data exists.
@@ -521,11 +662,22 @@ def _get_tabular_schema() -> str | None:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            "SELECT table_name, source_file, sheet_name, description, "
-            "columns_json, row_count FROM _tabular_meta "
-            "ORDER BY source_file, table_name"
-        ).fetchall()
+        if scored_tables:
+            names = [t[0] for t in scored_tables]
+            placeholders = ",".join("?" for _ in names)
+            rows = conn.execute(
+                "SELECT table_name, source_file, sheet_name, description, "
+                "columns_json, row_count FROM _tabular_meta "
+                f"WHERE table_name IN ({placeholders}) "
+                "ORDER BY source_file, table_name",
+                names,
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT table_name, source_file, sheet_name, description, "
+                "columns_json, row_count FROM _tabular_meta "
+                "ORDER BY source_file, table_name"
+            ).fetchall()
     except sqlite3.OperationalError:
         conn.close()
         return None
@@ -537,22 +689,22 @@ def _get_tabular_schema() -> str | None:
     parts = []
     for row in rows:
         cols = json.loads(row["columns_json"])
-        col_str = ", ".join(f"{name} ({dtype})" for name, dtype in cols.items())
         sheet_info = f", sheet: {row['sheet_name']}" if row["sheet_name"] else ""
         desc = row["description"]
-        desc_info = (
-            f"\n  Description: {desc} — ALL rows belong to this dataset."
-            if desc
-            else ""
+
+        comment_lines = [
+            f"-- source: {row['source_file']}{sheet_info}, {row['row_count']} rows"
+        ]
+        if desc:
+            comment_lines.append(f"-- {desc}")
+
+        col_defs = [f'  "{name}" {dtype.upper()}' for name, dtype in cols.items()]
+        create_stmt = (
+            f'CREATE TABLE "{row["table_name"]}" (\n' + ",\n".join(col_defs) + "\n);"
         )
-        block = (
-            f"Table: {row['table_name']} "
-            f"(source: {row['source_file']}{sheet_info}, "
-            f"{row['row_count']} rows)"
-            f"{desc_info}\n"
-            f"  Columns: {col_str}"
-        )
-        # Include sample rows so the LLM understands actual data values
+        block = "\n".join(comment_lines) + "\n" + create_stmt
+
+        # Append sample rows as SQL comments so the LLM sees real values
         try:
             sample = conn.execute(
                 f"SELECT * FROM \"{row['table_name']}\" LIMIT 3"
@@ -563,7 +715,9 @@ def _get_tabular_schema() -> str | None:
                 sample_lines = [
                     " | ".join(str(s[c]) for c in col_names) for s in sample
                 ]
-                block += f"\n  Sample rows:\n  {header}\n  " + "\n  ".join(sample_lines)
+                block += f"\n-- Sample rows:\n-- {header}\n-- " + "\n-- ".join(
+                    sample_lines
+                )
         except Exception:
             pass
         parts.append(block)
@@ -593,9 +747,19 @@ def _generate_sql(question: str, schema: str) -> str:
                     "Do not wrap it in markdown code fences.\n\n"
                     f"Schema:\n{schema}\n\n"
                     "Rules:\n"
-                    "- Use only tables and columns shown above.\n"
+                    "- CRITICAL: Use ONLY the exact table names and column "
+                    "names defined in the CREATE TABLE statements above. "
+                    "Never invent, guess, or abbreviate a column name.\n"
+                    "- If the answer needs a column that is not in the schema, "
+                    "reply: SELECT 'NOT_ANSWERABLE' AS error;\n"
                     "- SQLite syntax only.\n"
                     "- Always wrap column and table names in double quotes.\n"
+                    "- String values in WHERE clauses must use single quotes "
+                    "only: WHERE \"col\" = 'value'. Never wrap string values "
+                    "in double quotes.\n"
+                    "- Prefer a single-table query; only JOIN when you are "
+                    "certain both tables share an exact matching key column "
+                    "visible in the schema above.\n"
                     "- IMPORTANT: Each table already contains ALL rows for "
                     "its dataset. Do NOT add a WHERE clause to filter by a "
                     "company name, dataset name, or source name. Only use "
@@ -622,7 +786,7 @@ def _generate_sql(question: str, schema: str) -> str:
     resp = httpx.post(
         f"{settings.ollama_base_url}/api/chat",
         json=payload,
-        timeout=30.0,
+        timeout=settings.llm_timeout,
     )
     resp.raise_for_status()
     raw = resp.json().get("message", {}).get("content", "").strip()
@@ -686,7 +850,10 @@ _SQL_RESULT_SYSTEM_PROMPT = (
     "2. Be concise but complete.\n"
     "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
     "4. Do NOT show the SQL query.\n"
-    "5. Do NOT add citations or source references."
+    "5. Do NOT add citations or source references.\n"
+    "6. NEVER round, truncate, or approximate numeric values — "
+    "reproduce them exactly as they appear in the query results. "
+    "Never use words like 'approximately', 'about', 'around', or 'roughly'."
 )
 
 
@@ -787,15 +954,89 @@ def _sql_result_is_empty(rows: list[dict]) -> bool:
     return False
 
 
-def _handle_structured_query(question: str) -> str:
+def _build_table_citations(
+    scored_tables: list[tuple[str, float]],
+) -> list[dict]:
+    """Build citation dicts for structured query source tables.
+
+    Produces the same ``{text, score, citation: {filename, page, snippet}}``
+    shape used by unstructured retrieval so the UI renders them identically.
+    """
+    import sqlite3
+
+    if not scored_tables:
+        return []
+
+    db_path = settings.tabular_db_path
+    if not db_path.exists():
+        return []
+
+    score_map = dict(scored_tables)
+    names = [t[0] for t in scored_tables]
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in names)
+        rows = conn.execute(
+            "SELECT table_name, source_file, sheet_name, description, "
+            "columns_json FROM _tabular_meta "
+            f"WHERE table_name IN ({placeholders})",
+            names,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+
+    # Deduplicate by source_file — keep the sheet with the highest score
+    best_per_file: dict[str, dict] = {}
+    for row in rows:
+        fname = row["source_file"]
+        tname = row["table_name"]
+        score = score_map.get(tname, 0.0)
+        cols = json.loads(row["columns_json"])
+        col_list = ", ".join(f"{c} ({t})" for c, t in cols.items())
+        sheet = row["sheet_name"]
+        desc = row["description"] or ""
+
+        snippet_parts = []
+        if sheet:
+            snippet_parts.append(f"Sheet: {sheet}")
+        if desc:
+            snippet_parts.append(desc)
+        snippet_parts.append(f"Columns: {col_list}")
+        snippet = "\n".join(snippet_parts)
+
+        if fname not in best_per_file or score > best_per_file[fname]["score"]:
+            best_per_file[fname] = {
+                "text": desc,
+                "score": round(score, 3),
+                "citation": {
+                    "filename": fname,
+                    "page": None,
+                    "snippet": snippet,
+                },
+            }
+
+    result = sorted(best_per_file.values(), key=lambda x: x["score"], reverse=True)
+    return result
+
+
+def _handle_structured_query(
+    question: str,
+) -> tuple[str, list[tuple[str, float]] | None, list[dict]]:
     """Execute the full Text-to-SQL data agent pipeline (non-streaming).
 
     Returns:
-        Natural language answer, or ``""`` on failure (signals RAG fallback).
+        ``(answer, scored_tables, sql_rows)`` — answer is ``""`` on failure
+        (signals RAG fallback).  sql_rows contains the raw result rows so
+        callers can include them as context for evaluation.
     """
-    schema = _get_tabular_schema()
+    relevant_tables = _filter_relevant_tables(question)
+    schema = _get_tabular_schema(scored_tables=relevant_tables)
     if not schema:
-        return ""
+        return "", relevant_tables, []
 
     try:
         sql = _generate_sql(question, schema)
@@ -803,7 +1044,7 @@ def _handle_structured_query(question: str) -> str:
         rows = _execute_sql_safely(sql)
 
         if rows and "error" in rows[0] and rows[0]["error"] == "NOT_ANSWERABLE":
-            return ""
+            return "", relevant_tables, []
 
         # Retry once if the result is empty — the model likely added a
         # spurious WHERE clause.
@@ -820,21 +1061,24 @@ def _handle_structured_query(question: str) -> str:
             rows = _execute_sql_safely(sql)
 
         if _sql_result_is_empty(rows):
-            return ""
+            return "", relevant_tables, []
 
-        return _format_sql_result(question, sql, rows)
+        return _format_sql_result(question, sql, rows), relevant_tables, rows
     except Exception as exc:
         logger.warning("Structured query agent failed: %s", exc)
-        return ""
+        return "", relevant_tables, []
 
 
-def _handle_structured_query_stream(question: str) -> Iterator[str] | None:
+def _handle_structured_query_stream(
+    question: str,
+) -> tuple[Iterator[str], list[tuple[str, float]] | None] | None:
     """Execute the Text-to-SQL data agent pipeline (streaming).
 
     Returns:
-        Iterator of tokens, or ``None`` to signal fallback to RAG.
+        ``(token_iterator, scored_tables)`` or ``None`` to signal fallback.
     """
-    schema = _get_tabular_schema()
+    relevant_tables = _filter_relevant_tables(question)
+    schema = _get_tabular_schema(scored_tables=relevant_tables)
     if not schema:
         return None
 
@@ -862,7 +1106,7 @@ def _handle_structured_query_stream(question: str) -> Iterator[str] | None:
         if _sql_result_is_empty(rows):
             return None
 
-        return _stream_sql_result(question, sql, rows)
+        return _stream_sql_result(question, sql, rows), relevant_tables
     except Exception as exc:
         logger.warning("Structured query agent failed: %s", exc)
         return None
@@ -894,26 +1138,20 @@ def _build_llm_payload(
     )
 
     system_prompt = (
-        "You are a study assistant that answers ONLY from the provided "
-        "context. You have NO knowledge of your own — treat the context as "
-        "your only source of truth.\n\n"
-        "STRICT RULES:\n"
-        "1. Use ONLY facts that are explicitly stated in the context. Never "
-        "add information from outside the context, even if you know it.\n"
-        "2. If the context does not contain enough information to answer "
-        'the question, say: "The provided documents do not contain enough '
-        'information to answer this question."\n'
-        "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
-        "4. SYNTHESIZE information across ALL provided sources into one "
-        "coherent answer — do not just parrot or summarise a single "
-        "source. Merge overlapping ideas, resolve redundancies, and "
-        "combine unique details from each source. If two sources say "
-        "the same thing in different words, state the idea ONCE in your "
-        "own words. Start with a clear definition, then explain key "
-        "details, categories, applications, or examples. Aim for a "
-        "comprehensive response that adds value beyond any single "
-        "source alone.\n"
-        "5. Do NOT add citations or source references — they are handled "
+        "You are a precise document assistant. Answer the question using "
+        "ONLY the provided context.\n\n"
+        "RULES:\n"
+        "1. Use ONLY facts from the context. Do not add outside knowledge.\n"
+        "2. Extract and synthesize information — look for answers in "
+        "headings, footers, author lines, slide titles, metadata, and "
+        "inline references, not just body paragraphs.\n"
+        "3. If the context partially answers the question, provide what "
+        'you can find. Only say "Information not found in the provided '
+        'documents." if the context truly contains NOTHING relevant.\n'
+        "4. ALWAYS answer in the SAME LANGUAGE as the question.\n"
+        "5. Be concise and direct. Answer the question first, then "
+        "elaborate only if needed.\n"
+        "6. Do NOT add citations or source references — they are handled "
         "separately."
     )
 

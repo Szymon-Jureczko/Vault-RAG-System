@@ -1,50 +1,39 @@
-# ── Core LLM / RAG (local Ollama backend) ────────────────────────────────────
-langchain>=0.3
-langchain-community>=0.3
-langchain-ollama>=0.2
-
 # ── Embeddings (local, best latency/RAM trade-off on i5 + 16 GB) ─────────────
-sentence-transformers>=3.0            # all-MiniLM-L6-v2
-torch>=2.2                            # sentence-transformers runtime
+sentence-transformers>=3.0            # all-MiniLM-L6-v2 + CrossEncoder re-ranker
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2                            # CPU-only — no NVIDIA/CUDA (~2 GB lighter)
+transformers>=4.40                    # AutoTokenizer for ONNX embedding path
+optimum[onnxruntime]>=1.19            # ONNX inference (primary embedding path)
+numpy>=1.26                           # tensor/array ops across pipeline & retriever
 
 # ── Vector Store — ChromaDB persistent disk mode ─────────────────────────────
 chromadb>=0.5
 
 # ── Document Parsers ──────────────────────────────────────────────────────────
 pymupdf>=1.24                         # PyMuPDF — fast PDF extraction
-docling>=2.0                          # layout-aware parsing (scanned PDFs via RapidOCR)
+python-docx>=1.1                      # DOCX parsing
 rapidocr-onnxruntime>=1.3             # ONNX-based OCR; 3-10x faster than Tesseract on CPU
-pytesseract>=0.3                      # kept as fallback; replaced by rapidocr in hot path
 
 # ── State DB / incremental logic ─────────────────────────────────────────────
 # SQLite ships with Python stdlib — no package needed.
-# Pydantic for typed models throughout.
 pydantic>=2.0
 pydantic-settings>=2.0
 
-# ── Retrieval (Phase 3) ──────────────────────────────────────────────────────
+# ── Retrieval ────────────────────────────────────────────────────────────────
 rank-bm25>=0.2                         # BM25 keyword search
 
-# ── API Server (Phase 4) ─────────────────────────────────────────────────────
+# ── API Server ───────────────────────────────────────────────────────────────
 fastapi>=0.115
 uvicorn[standard]>=0.30
 streamlit>=1.35                        # Researcher Dashboard
 
-# ── Evaluation (Phase 5) ─────────────────────────────────────────────────────
-ragas>=0.1
-datasets>=2.18
-
-# ── Azure Blob Storage (optional — only needed when INGESTION_SOURCE=AZURE) ────
+# ── Azure Blob Storage (optional — only needed when INGESTION_SOURCE=AZURE) ──
 azure-storage-blob>=12.0
 
-# ── Utilities ─────────────────────────────────────────────────────────────────
-python-dotenv>=1.0
-tenacity>=8.0
-httpx>=0.27
-Pillow>=10.0                           # Tesseract OCR image loading
+# ── Tabular ingestion ────────────────────────────────────────────────────────
+pandas>=2.2
+openpyxl>=3.1                          # Excel file support for pandas
 
-# ── Dev / Notebook ────────────────────────────────────────────────────────────
-jupyterlab>=4.0
-ipykernel>=6.0
-pytest>=8.0
-pytest-asyncio>=0.24
+# ── Utilities ────────────────────────────────────────────────────────────────
+httpx>=0.27
+Pillow>=10.0                           # Image processing for OCR pipeline

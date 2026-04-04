@@ -31,17 +31,20 @@ On stronger hardware the pipeline scales up with a few parameter changes:
 ## Features
 
 - **Query router** — LLM-based classifier routes each question as *structured* (analytical/tabular) or *unstructured* (knowledge), dispatching to the SQL agent or RAG pipeline accordingly
-- **Text-to-SQL data agent** — generates SQL from natural language, executes safely against a read-only SQLite connection, formats results via LLM, and automatically retries with relaxed filters on empty results
+- **Text-to-SQL data agent** — generates SQL from natural language, executes safely against a read-only SQLite connection, formats results via LLM, and automatically retries with relaxed filters on empty results; returns exact values verbatim without rounding or approximation
+- **BM25 table pre-filter** — BM25 scores all table metadata against the user query and feeds only the top-K most relevant tables into the LLM prompt, preventing context-window overflow on large corpora (e.g. 10 of 217 tables selected)
+- **Scored table citations** — structured query responses include source table names, sheet, and BM25 relevance scores in the same Citations & Sources format used by unstructured queries
 - **Tabular ingestion** — XLSX and CSV files are loaded into SQLite (`data/tabular.db`) with auto-detected header rows, sanitized column names, and numeric type coercion via pandas
 - **Multimodal document ingestion** — PDF, DOCX, XLSX, EML, images (PNG/JPG/TIFF/BMP), and plain text (TXT, MD, CSV, JSON, XML, HTML)
 - **Azure Blob Storage ingestion** — ingest documents directly from an Azure container; blobs are downloaded, parsed, and indexed with a single API call or dashboard button
 - **Scanned document OCR** — RapidOCR (ONNX Runtime) with fast gating, text-density probing, reduced DPI/resolution limits, and `malloc_trim` to return freed heap pages to the OS
 - **Hybrid retrieval** — BM25 keyword + semantic vector + filename lookup + proper-noun phrase matching, merged via Reciprocal Rank Fusion; optional `source_filter` to restrict results by ingestion source
-- **Cross-encoder reranking** — multilingual mmarco-mMiniLMv2-L12-H384-v1 refines top results for precision
+- **Cross-encoder reranking** — multilingual mmarco-mMiniLMv2-L12-H384-v1 refines top results; chunks scoring below 0.3 are filtered out before LLM generation to reduce noise
+- **Context quality filtering** — short or garbage chunks (< 50 chars after stripping source prefix) are dropped before passing context to the LLM, improving answer focus
 - **Citations on every result** — filename, page number, and text snippet
 - **Incremental processing** — SQLite state DB with MD5 change detection; source-prefixed keys keep LOCAL and Azure records independent across resyncs
 - **Memory-safe on 16 GB RAM** — two-phase pipeline, model swapping, batch commits, `gc.collect()` checkpoints, and subprocess isolation of the sync worker to reduce import overhead from ~300 MB to ~2 MB
-- **RAGAS evaluation** — automated golden dataset generation, Faithfulness / Context Precision / Answer Relevancy scoring, ingestion throughput and query latency benchmarks
+- **RAGAS evaluation** — curated golden dataset, Faithfulness / Context Precision / Answer Relevancy scoring with multilingual embeddings, ingestion throughput and query latency benchmarks; reusable via `--use-existing-dataset`
 - **Production API + dashboard** — FastAPI REST endpoints with thread-safe singleton retriever, and Streamlit researcher dashboard with streaming chat interface
 
 ## Architecture
@@ -238,7 +241,9 @@ localvaultrag/
 ├── vector_db/
 │   └── retriever.py            # Hybrid retriever (BM25 + semantic + reranking)
 ├── evals/
-│   └── ragas_suite.py          # RAGAS evaluation + benchmarking CLI
+│   ├── ragas_suite.py          # RAGAS evaluation + benchmarking CLI
+│   ├── golden_dataset.json     # Curated 12-question evaluation dataset
+│   └── results.json            # Latest evaluation results
 ├── scripts/
 │   └── generate_test_docs.py   # Synthetic test document generator (Faker)
 ├── tests/
@@ -288,11 +293,13 @@ Each incoming question is classified by the LLM as *structured* (analytical/tabu
 
 For structured queries the agent:
 
-1. Reads the SQLite schema from `tabular.db`
-2. Asks the LLM to generate a `SELECT` statement
-3. Executes the SQL on a read-only connection
-4. If the result is empty, retries with relaxed WHERE filters
-5. Formats the result rows via the LLM into a natural-language answer
+1. **Pre-filters tables** — BM25 scores all table metadata (names, column names, sample values) against the question and selects the top-K most relevant tables (default 10), keeping the schema prompt well within the LLM context window even with hundreds of tables
+2. Reads the SQLite schema for the selected tables from `tabular.db`
+3. Asks the LLM to generate a `SELECT` statement
+4. Executes the SQL on a read-only connection
+5. If the result is empty, retries once with relaxed WHERE filters
+6. Formats the result rows via the LLM into a natural-language answer with exact values (no rounding or approximation)
+7. Attaches scored table citations (source file, sheet, BM25 relevance) to the response
 
 ### Hybrid Retrieval
 
@@ -307,7 +314,7 @@ Each query goes through a multi-signal pipeline:
 
 ### Answer Generation
 
-The top 5 retrieved chunks are formatted as context and sent to the local Ollama instance (Llama 3.2). The system prompt instructs the LLM to answer only from provided context and cite sources.
+Retrieved chunks are filtered by cross-encoder score (threshold 0.3) and short fragments (< 50 chars) are dropped. Up to 7 chunks are formatted as context and sent to the local Ollama instance (Llama 3.2). The system prompt instructs the LLM to answer only from provided context — extracting from headings, metadata, and footers when needed — and to cite sources. It only refuses when the context truly contains nothing relevant.
 
 ## Configuration
 
@@ -322,6 +329,7 @@ All settings are managed via environment variables (see [`.env.example`](.env.ex
 | `CHROMA_PERSIST_PATH` | `data/chroma` | ChromaDB storage directory |
 | `STATE_DB_PATH` | `data/state.db` | SQLite state database path |
 | `TABULAR_DB_PATH` | `data/tabular.db` | SQLite database for ingested XLSX/CSV tables |
+| `STRUCTURED_TOP_K` | `10` | Max tables passed to the Text-to-SQL agent (BM25 pre-filter) |
 | `MAX_WORKERS` | `2` | Parallel workers for fast-format parsing |
 | `APP_ENV` | `development` | Application environment |
 | `INGESTION_SOURCE` | `LOCAL` | Document source: `LOCAL` or `AZURE` |
@@ -363,16 +371,31 @@ pytest
 Run the RAGAS evaluation and benchmarking suite (requires the API server to be running):
 
 ```bash
+# Generate a new golden dataset and evaluate
 python -m evals.ragas_suite --data-dir data/ --sample-size 50 --questions 20
+
+# Re-evaluate against the committed golden dataset (no generation step)
+python -m evals.ragas_suite --use-existing-dataset
 ```
 
-This will:
-1. **Generate a golden dataset** — sample documents, parse them, and use Ollama to create Q&A pairs
-2. **Evaluate with RAGAS** — measure Faithfulness, Context Precision, and Answer Relevancy
-3. **Benchmark ingestion** — measure files-per-minute throughput
-4. **Benchmark queries** — measure average query latency
+The suite:
+1. **Generates or loads a golden dataset** — samples documents, extracts Q&A pairs via LLM (or loads `evals/golden_dataset.json` with `--use-existing-dataset`)
+2. **Warms up the server** — sends a preflight query so the first real question isn't lost to cold-start model loading
+3. **Evaluates with RAGAS** — measures Faithfulness, Context Precision, and Answer Relevancy using `gpt-4o-mini` as judge LLM and `paraphrase-multilingual-MiniLM-L12-v2` for answer relevancy embeddings (multilingual-aware scoring)
+4. **Benchmarks ingestion** — measures files-per-minute throughput
+5. **Benchmarks queries** — measures average query latency
 
 Results are saved to `evals/results.json`.
+
+### Latest results (12-question golden dataset, Ollama Llama 3.2 + OpenAI judge)
+
+| Metric | Score |
+|--------|-------|
+| Faithfulness | **0.881** |
+| Context Precision | **0.893** |
+| Answer Relevancy | **0.848** |
+| Ingestion throughput | 8,061 files/min |
+| Avg query latency | 39,611 ms |
 
 ## License
 

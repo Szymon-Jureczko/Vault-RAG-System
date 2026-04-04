@@ -1,0 +1,12 @@
+# Dev / test / evaluation dependencies — NOT needed in production.
+# Install with:  pip install -r requirements-dev.txt
+-r requirements.txt
+
+# ── Evaluation ──────────────────────────────────────────────────────────────
+ragas>=0.1
+datasets>=2.18
+langchain-huggingface>=0.1
+openai>=1.0                           # used directly in evals/ragas_suite.py
+
+# ── Testing ─────────────────────────────────────────────────────────────────
+pytest>=8.0

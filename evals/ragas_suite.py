@@ -6,7 +6,11 @@ Files-Per-Minute ingestion throughput and Query Latency.
 
 Usage::
 
-    python -m evals.ragas_suite --data-dir data/ \\
+    python -m evals.ragas_suite --data-dir data/test_docs/ \\
+        --sample-size 50 --questions 20
+
+    # Use Azure blob container as document source:
+    python -m evals.ragas_suite --source azure \\
         --sample-size 50 --questions 20
 """
 
@@ -15,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
+import os
 import time
 from pathlib import Path
 
@@ -24,6 +30,12 @@ from pydantic import BaseModel, Field
 from ingestion.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Suppress Azure SDK's verbose HTTP transport logs
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(
+    logging.WARNING
+)
+logging.getLogger("azure.storage.blob").setLevel(logging.WARNING)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
 API_BASE = "http://localhost:8000"
@@ -122,12 +134,20 @@ def generate_golden_dataset(
     # Extract text from each file
     file_texts: list[tuple[str, str]] = []
     for fp in files:
-        result = parse_file(fp, chunk_size=2000)
+        result = parse_file(
+            fp, chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap
+        )
         if result.success and result.chunks:
             text = result.chunks[0].text[:1500]
             file_texts.append((fp.name, text))
 
     questions: list[GoldenQuestion] = []
+
+    # Use OpenAI for question generation when API key is available
+    openai_key = settings.openai_api_key or os.environ.get("OPENAI_API_KEY", "")
+    use_openai = bool(openai_key)
+    if use_openai:
+        logger.info("Using OpenAI for golden question generation")
 
     for filename, text in file_texts:
         if len(questions) >= num_questions:
@@ -135,23 +155,38 @@ def generate_golden_dataset(
 
         prompt = (
             "Generate a factual question and answer based on this document "
-            "excerpt. Return ONLY valid JSON: "
+            "excerpt. The question must be complete, well-formed, and in the "
+            "same language as the excerpt. Return ONLY valid JSON: "
             '{"question": "...", "answer": "..."}\n\n'
             f"Document: {filename}\n\nExcerpt:\n{text}\n\nJSON:"
         )
 
         try:
-            resp = httpx.post(
-                f"{settings.ollama_base_url}/api/generate",
-                json={
-                    "model": settings.ollama_model_dev,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
+            if use_openai:
+                resp = httpx.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {openai_key}"},
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.0,
+                    },
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"]
+            else:
+                resp = httpx.post(
+                    f"{settings.ollama_base_url}/api/generate",
+                    json={
+                        "model": settings.ollama_model_dev,
+                        "prompt": prompt,
+                        "stream": False,
+                    },
+                    timeout=60.0,
+                )
+                resp.raise_for_status()
+                raw = resp.json().get("response", "")
             # Extract JSON from response
             start = raw.find("{")
             end = raw.rfind("}") + 1
@@ -167,12 +202,14 @@ def generate_golden_dataset(
         except Exception as exc:
             logger.warning(
                 "Failed to generate question from %s: %s",
-                filename, exc,
+                filename,
+                exc,
             )
 
     logger.info(
         "Generated %d golden questions from %d files",
-        len(questions), len(file_texts),
+        len(questions),
+        len(file_texts),
     )
     return questions
 
@@ -194,15 +231,52 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
     """
     try:
         from datasets import Dataset
+        from langchain_huggingface import HuggingFaceEmbeddings
+        from openai import AsyncOpenAI
         from ragas import evaluate
-        from ragas.metrics import (
-            answer_relevancy,
-            context_precision,
-            faithfulness,
-        )
+        from ragas.llms import llm_factory
+        from ragas.metrics._answer_relevance import AnswerRelevancy
+        from ragas.metrics._context_precision import ContextPrecision
+        from ragas.metrics._faithfulness import Faithfulness
+        from ragas.run_config import RunConfig
     except ImportError:
         logger.error("RAGAS not installed. Run: pip install ragas datasets")
         return _fallback_evaluate(questions)
+
+    # Prefer OpenAI for the judge LLM when an API key is available;
+    # fall back to local Ollama otherwise.
+    openai_key = settings.openai_api_key
+    if openai_key:
+        logger.info("Using OpenAI judge LLM (gpt-4o-mini)")
+        client = AsyncOpenAI(api_key=openai_key)
+        judge_llm = llm_factory("gpt-4o-mini", provider="openai", client=client)
+    else:
+        logger.info("Using Ollama judge LLM (%s)", settings.ollama_model_eval)
+        client = AsyncOpenAI(
+            api_key="ollama",
+            base_url=f"{settings.ollama_base_url}/v1",
+        )
+        judge_llm = llm_factory(
+            settings.ollama_model_eval,
+            provider="openai",
+            client=client,
+        )
+    # Use a multilingual model for answer relevancy so non-English questions
+    # (Polish, etc.) are scored correctly instead of being penalised by the
+    # English-only all-MiniLM-L6-v2 model.
+    judge_embeddings = HuggingFaceEmbeddings(
+        model_name="paraphrase-multilingual-MiniLM-L12-v2"
+    )
+
+    metrics = [
+        Faithfulness(llm=judge_llm),  # type: ignore[arg-type]
+        ContextPrecision(llm=judge_llm),  # type: ignore[arg-type]
+        AnswerRelevancy(
+            llm=judge_llm,  # type: ignore[arg-type]
+            embeddings=judge_embeddings,  # type: ignore[arg-type]
+            strictness=1,
+        ),
+    ]
 
     # Collect RAG responses
     rows = {"question": [], "answer": [], "contexts": [], "ground_truth": []}
@@ -211,8 +285,8 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
         try:
             resp = httpx.post(
                 f"{API_BASE}/query",
-                json={"question": q.question, "top_k": 5},
-                timeout=120,
+                json={"question": q.question, "top_k": 8},
+                timeout=300,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -220,7 +294,11 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
             rows["question"].append(q.question)
             rows["answer"].append(data.get("answer", ""))
             rows["contexts"].append(
-                [r["text"] for r in data.get("results", [])]
+                [
+                    r["text"]
+                    for r in data.get("results", [])
+                    if r.get("text", "").strip()
+                ]
             )
             rows["ground_truth"].append(q.ground_truth)
         except Exception as exc:
@@ -234,10 +312,20 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
 
     result = evaluate(
         dataset,
-        metrics=[faithfulness, context_precision, answer_relevancy],
+        metrics=metrics,
+        run_config=RunConfig(
+            timeout=600,
+            max_retries=1,
+            max_wait=5,
+            max_workers=1,
+        ),
+        raise_exceptions=False,
     )
 
     eval_results = []
+    faith_scores = result["faithfulness"]  # type: ignore[index]
+    cp_scores = result["context_precision"]  # type: ignore[index]
+    ar_scores = result["answer_relevancy"]  # type: ignore[index]
     for i, q in enumerate(questions):
         eval_results.append(
             EvalResult(
@@ -245,9 +333,21 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
                 answer=rows["answer"][i],
                 contexts=rows["contexts"][i],
                 ground_truth=q.ground_truth,
-                faithfulness=result.get("faithfulness", 0.0),
-                context_precision=result.get("context_precision", 0.0),
-                answer_relevancy=result.get("answer_relevancy", 0.0),
+                faithfulness=(
+                    faith_scores[i]
+                    if faith_scores[i] is not None and not math.isnan(faith_scores[i])
+                    else 0.0
+                ),
+                context_precision=(
+                    cp_scores[i]
+                    if cp_scores[i] is not None and not math.isnan(cp_scores[i])
+                    else 0.0
+                ),
+                answer_relevancy=(
+                    ar_scores[i]
+                    if ar_scores[i] is not None and not math.isnan(ar_scores[i])
+                    else 0.0
+                ),
             )
         )
 
@@ -270,7 +370,7 @@ def _fallback_evaluate(questions: list[GoldenQuestion]) -> list[EvalResult]:
         try:
             resp = httpx.post(
                 f"{API_BASE}/query",
-                json={"question": q.question, "top_k": 5},
+                json={"question": q.question, "top_k": 8},
                 timeout=120,
             )
             resp.raise_for_status()
@@ -285,16 +385,14 @@ def _fallback_evaluate(questions: list[GoldenQuestion]) -> list[EvalResult]:
             )
         except Exception as exc:
             logger.warning("Fallback query failed: %s", exc)
-            results.append(
-                EvalResult(question=q.question, ground_truth=q.ground_truth)
-            )
+            results.append(EvalResult(question=q.question, ground_truth=q.ground_truth))
     return results
 
 
 # ── Benchmarking ───────────────────────────────────────────────────────────
 
 
-def benchmark_ingestion(data_dir: str = "data/") -> BenchmarkResult:
+def benchmark_ingestion(data_dir: str = "data/test_docs/") -> BenchmarkResult:
     """Measure ingestion throughput (Files-Per-Minute).
 
     Args:
@@ -311,12 +409,29 @@ def benchmark_ingestion(data_dir: str = "data/") -> BenchmarkResult:
             timeout=600,
         )
         resp.raise_for_status()
-        stats = resp.json()["stats"]
+        data = resp.json()
+        job_id = data.get("job_id")
+        stats = data.get("stats")
+
+        # POST /sync is async; poll until complete if we got a job_id.
+        if job_id and stats is None:
+            for _ in range(120):  # up to 10 minutes
+                time.sleep(5)
+                poll = httpx.get(f"{API_BASE}/sync/{job_id}", timeout=30)
+                poll.raise_for_status()
+                poll_data = poll.json()
+                status = poll_data.get("status", "")
+                if status == "completed" or status.startswith("failed"):
+                    stats = poll_data.get("stats")
+                    break
     except Exception as exc:
         logger.error("Ingestion benchmark failed: %s", exc)
         return BenchmarkResult()
 
     elapsed = time.perf_counter() - start
+    if stats is None:
+        logger.error("Ingestion benchmark: no stats returned")
+        return BenchmarkResult()
     total = stats.get("total_discovered", 0)
     fpm = (total / elapsed) * 60 if elapsed > 0 else 0
 
@@ -342,7 +457,7 @@ def benchmark_queries(questions: list[GoldenQuestion]) -> BenchmarkResult:
         try:
             resp = httpx.post(
                 f"{API_BASE}/query",
-                json={"question": q.question, "top_k": 5},
+                json={"question": q.question, "top_k": 8},
                 timeout=120,
             )
             resp.raise_for_status()
@@ -357,51 +472,149 @@ def benchmark_queries(questions: list[GoldenQuestion]) -> BenchmarkResult:
     )
 
 
+def _warmup_server(max_wait: int = 90) -> None:
+    """Send a dummy query to wake the server before evaluation starts.
+
+    The first real request often times out because the embedding model loads
+    lazily on the first call.  This preflight query absorbs that cold-start
+    cost so that no golden question is lost to a timeout.
+
+    Args:
+        max_wait: Seconds to keep retrying before giving up.
+    """
+    logger.info("Warming up server (max %ds)...", max_wait)
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        try:
+            resp = httpx.post(
+                f"{API_BASE}/query",
+                json={"question": "warmup", "top_k": 1},
+                timeout=min(30.0, deadline - time.time()),
+            )
+            if resp.status_code == 200:
+                logger.info("Server warmup complete")
+                return
+        except Exception:
+            pass
+        time.sleep(3)
+    logger.warning("Server warmup timed out after %ds — proceeding anyway", max_wait)
+
+
 # ── CLI entrypoint ─────────────────────────────────────────────────────────
+
+
+def _resolve_azure_data_dir() -> Path:
+    """Download blobs from Azure to the local staging path and return it.
+
+    Validates that the required Azure settings are configured, creates the
+    staging directory if absent, then delegates to ``download_azure_blobs``.
+
+    Returns:
+        Path to the local staging directory containing the downloaded blobs.
+
+    Raises:
+        SystemExit: If Azure credentials or container name are not configured.
+    """
+    from ingestion.pipeline import download_azure_blobs
+
+    if not settings.azure_storage_connection_string:
+        logger.error("AZURE_STORAGE_CONNECTION_STRING must be set for --source azure")
+        raise SystemExit(1)
+    if not settings.azure_container_name:
+        logger.error("AZURE_CONTAINER_NAME must be set for --source azure")
+        raise SystemExit(1)
+
+    staging = settings.azure_staging_path
+    staging.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Downloading blobs from container '%s' to %s ...",
+        settings.azure_container_name,
+        staging,
+    )
+    count = download_azure_blobs(staging)
+    logger.info("Downloaded %d blob(s) from Azure", count)
+    return staging
 
 
 def main() -> None:
     """Run the full evaluation and benchmarking suite."""
     parser = argparse.ArgumentParser(description="RAGAS Evaluation Suite")
     parser.add_argument(
-        "--data-dir", default="data/",
-        help="Document source directory",
+        "--source",
+        choices=["local", "azure"],
+        default="local",
+        help=(
+            "Document source: 'local' (default) or 'azure' "
+            "(downloads from blob storage)"
+        ),
     )
     parser.add_argument(
-        "--sample-size", type=int, default=50,
+        "--data-dir",
+        default="data/test_docs/",
+        help="Document source directory (local source only)",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=50,
         help="Max docs to sample",
     )
     parser.add_argument(
-        "--questions", type=int, default=20,
+        "--questions",
+        type=int,
+        default=20,
         help="Golden questions to generate",
     )
     parser.add_argument(
-        "--output", default="evals/results.json",
+        "--output",
+        default="evals/results.json",
         help="Output file path",
+    )
+    parser.add_argument(
+        "--use-existing-dataset",
+        action="store_true",
+        help=(
+            "Skip question generation and use the existing "
+            "evals/golden_dataset.json as-is"
+        ),
     )
     args = parser.parse_args()
 
-    data_dir = Path(args.data_dir)
-
-    # Step 1: Generate golden dataset
-    logger.info("Generating golden dataset...")
-    golden = generate_golden_dataset(
-        data_dir, args.sample_size, args.questions,
-    )
-
-    if not golden:
-        logger.error("No golden questions generated. Check data directory.")
-        return
-
-    # Save golden dataset
     golden_path = Path("evals/golden_dataset.json")
-    golden_path.parent.mkdir(parents=True, exist_ok=True)
-    golden_path.write_text(
-        json.dumps([q.model_dump() for q in golden], indent=2)
-    )
-    logger.info("Golden dataset saved to %s", golden_path)
+
+    if args.use_existing_dataset:
+        if not golden_path.exists():
+            logger.error("--use-existing-dataset set but %s not found", golden_path)
+            return
+        golden = [GoldenQuestion(**q) for q in json.loads(golden_path.read_text())]
+        logger.info("Loaded %d questions from existing %s", len(golden), golden_path)
+        data_dir = Path(args.data_dir)  # still needed for ingestion benchmark
+    else:
+        if args.source == "azure":
+            data_dir = _resolve_azure_data_dir()
+        else:
+            data_dir = Path(args.data_dir)
+
+        # Step 1: Generate golden dataset
+        logger.info("Generating golden dataset...")
+        golden = generate_golden_dataset(
+            data_dir,
+            args.sample_size,
+            args.questions,
+        )
+
+        if not golden:
+            logger.error("No golden questions generated. Check data directory.")
+            return
+
+        # Save golden dataset
+        golden_path.parent.mkdir(parents=True, exist_ok=True)
+        golden_path.write_text(json.dumps([q.model_dump() for q in golden], indent=2))
+        logger.info("Golden dataset saved to %s", golden_path)
 
     # Step 2: RAGAS evaluation
+    _warmup_server()
     logger.info("Running RAGAS evaluation...")
     eval_results = evaluate_ragas(golden)
 
@@ -430,15 +643,9 @@ def main() -> None:
     # Summary
     if eval_results:
         n = len(eval_results)
-        avg_faith = sum(
-            r.faithfulness for r in eval_results
-        ) / n
-        avg_prec = sum(
-            r.context_precision for r in eval_results
-        ) / n
-        avg_rel = sum(
-            r.answer_relevancy for r in eval_results
-        ) / n
+        avg_faith = sum(r.faithfulness for r in eval_results) / n
+        avg_prec = sum(r.context_precision for r in eval_results) / n
+        avg_rel = sum(r.answer_relevancy for r in eval_results) / n
         print(f"\n{'='*50}")
         print("RAGAS Evaluation Summary")
         print(f"{'='*50}")
