@@ -14,6 +14,8 @@
 
 Vault-RAG-System ingests enterprise documents at any scale — PDFs, Word files, spreadsheets, emails, and scanned images — indexes them with a hybrid search engine, and answers natural-language questions with cited sources. Documents can come from local disk or Azure Blob Storage. All LLM inference and vector search run on your machine via Ollama and ChromaDB — no OpenAI keys, no external AI APIs.
 
+<img width="1855" height="949" alt="projimg2" src="https://github.com/user-attachments/assets/9fda9143-b161-415b-ab5e-ef8e1e424d6a" />
+
 Built for commodity hardware: optimized to run on an Intel i5 with 16 GB RAM. There is no hard limit on document count — incremental processing, two-phase model swapping, and batch commits keep memory stable regardless of corpus size. Ingestion scales linearly: more documents means more time, not more memory.
 
 On stronger hardware the pipeline scales up with a few parameter changes:
