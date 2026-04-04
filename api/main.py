@@ -1066,7 +1066,7 @@ def _handle_structured_query(
         return _format_sql_result(question, sql, rows), relevant_tables, rows
     except Exception as exc:
         logger.warning("Structured query agent failed: %s", exc)
-        return "", relevant_tables, [], []
+        return "", relevant_tables, []
 
 
 def _handle_structured_query_stream(

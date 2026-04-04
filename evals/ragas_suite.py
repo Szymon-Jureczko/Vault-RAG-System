@@ -269,9 +269,13 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
     )
 
     metrics = [
-        Faithfulness(llm=judge_llm),
-        ContextPrecision(llm=judge_llm),
-        AnswerRelevancy(llm=judge_llm, embeddings=judge_embeddings, strictness=1),
+        Faithfulness(llm=judge_llm),  # type: ignore[arg-type]
+        ContextPrecision(llm=judge_llm),  # type: ignore[arg-type]
+        AnswerRelevancy(
+            llm=judge_llm,  # type: ignore[arg-type]
+            embeddings=judge_embeddings,  # type: ignore[arg-type]
+            strictness=1,
+        ),
     ]
 
     # Collect RAG responses
@@ -319,9 +323,9 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
     )
 
     eval_results = []
-    faith_scores = result["faithfulness"]
-    cp_scores = result["context_precision"]
-    ar_scores = result["answer_relevancy"]
+    faith_scores = result["faithfulness"]  # type: ignore[index]
+    cp_scores = result["context_precision"]  # type: ignore[index]
+    ar_scores = result["answer_relevancy"]  # type: ignore[index]
     for i, q in enumerate(questions):
         eval_results.append(
             EvalResult(
@@ -540,7 +544,10 @@ def main() -> None:
         "--source",
         choices=["local", "azure"],
         default="local",
-        help="Document source: 'local' (default) or 'azure' (downloads from blob storage)",
+        help=(
+            "Document source: 'local' (default) or 'azure' "
+            "(downloads from blob storage)"
+        ),
     )
     parser.add_argument(
         "--data-dir",
@@ -567,7 +574,10 @@ def main() -> None:
     parser.add_argument(
         "--use-existing-dataset",
         action="store_true",
-        help="Skip question generation and use the existing evals/golden_dataset.json as-is",
+        help=(
+            "Skip question generation and use the existing "
+            "evals/golden_dataset.json as-is"
+        ),
     )
     args = parser.parse_args()
 
