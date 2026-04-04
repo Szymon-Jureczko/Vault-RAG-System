@@ -1,4 +1,4 @@
-FROM python:3.12-bookworm
+FROM python:3.12-slim-bookworm
 
 # System dependencies
 # - libgl1 / libglib2.0-0 for PyMuPDF / OpenCV
@@ -6,7 +6,6 @@ FROM python:3.12-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
-    wget \
     vim \
     build-essential \
     # PyMuPDF / image processing

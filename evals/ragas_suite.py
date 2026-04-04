@@ -134,7 +134,9 @@ def generate_golden_dataset(
     # Extract text from each file
     file_texts: list[tuple[str, str]] = []
     for fp in files:
-        result = parse_file(fp, chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
+        result = parse_file(
+            fp, chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap
+        )
         if result.success and result.chunks:
             text = result.chunks[0].text[:1500]
             file_texts.append((fp.name, text))
@@ -228,10 +230,10 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
         List of EvalResult instances.
     """
     try:
-        from openai import AsyncOpenAI
         from datasets import Dataset
-        from ragas import evaluate
         from langchain_huggingface import HuggingFaceEmbeddings
+        from openai import AsyncOpenAI
+        from ragas import evaluate
         from ragas.llms import llm_factory
         from ragas.metrics._answer_relevance import AnswerRelevancy
         from ragas.metrics._context_precision import ContextPrecision
@@ -255,9 +257,16 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
             base_url=f"{settings.ollama_base_url}/v1",
         )
         judge_llm = llm_factory(
-            settings.ollama_model_eval, provider="openai", client=client,
+            settings.ollama_model_eval,
+            provider="openai",
+            client=client,
         )
-    judge_embeddings = HuggingFaceEmbeddings(model_name=settings.embedding_model)
+    # Use a multilingual model for answer relevancy so non-English questions
+    # (Polish, etc.) are scored correctly instead of being penalised by the
+    # English-only all-MiniLM-L6-v2 model.
+    judge_embeddings = HuggingFaceEmbeddings(
+        model_name="paraphrase-multilingual-MiniLM-L12-v2"
+    )
 
     metrics = [
         Faithfulness(llm=judge_llm),
@@ -272,7 +281,7 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
         try:
             resp = httpx.post(
                 f"{API_BASE}/query",
-                json={"question": q.question, "top_k": 5},
+                json={"question": q.question, "top_k": 8},
                 timeout=300,
             )
             resp.raise_for_status()
@@ -280,7 +289,13 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
 
             rows["question"].append(q.question)
             rows["answer"].append(data.get("answer", ""))
-            rows["contexts"].append([r["text"] for r in data.get("results", [])])
+            rows["contexts"].append(
+                [
+                    r["text"]
+                    for r in data.get("results", [])
+                    if r.get("text", "").strip()
+                ]
+            )
             rows["ground_truth"].append(q.ground_truth)
         except Exception as exc:
             logger.warning("Query failed for '%s': %s", q.question, exc)
@@ -314,9 +329,21 @@ def evaluate_ragas(questions: list[GoldenQuestion]) -> list[EvalResult]:
                 answer=rows["answer"][i],
                 contexts=rows["contexts"][i],
                 ground_truth=q.ground_truth,
-                faithfulness=faith_scores[i] if faith_scores[i] is not None and not math.isnan(faith_scores[i]) else 0.0,
-                context_precision=cp_scores[i] if cp_scores[i] is not None and not math.isnan(cp_scores[i]) else 0.0,
-                answer_relevancy=ar_scores[i] if ar_scores[i] is not None and not math.isnan(ar_scores[i]) else 0.0,
+                faithfulness=(
+                    faith_scores[i]
+                    if faith_scores[i] is not None and not math.isnan(faith_scores[i])
+                    else 0.0
+                ),
+                context_precision=(
+                    cp_scores[i]
+                    if cp_scores[i] is not None and not math.isnan(cp_scores[i])
+                    else 0.0
+                ),
+                answer_relevancy=(
+                    ar_scores[i]
+                    if ar_scores[i] is not None and not math.isnan(ar_scores[i])
+                    else 0.0
+                ),
             )
         )
 
@@ -339,7 +366,7 @@ def _fallback_evaluate(questions: list[GoldenQuestion]) -> list[EvalResult]:
         try:
             resp = httpx.post(
                 f"{API_BASE}/query",
-                json={"question": q.question, "top_k": 5},
+                json={"question": q.question, "top_k": 8},
                 timeout=120,
             )
             resp.raise_for_status()
@@ -426,7 +453,7 @@ def benchmark_queries(questions: list[GoldenQuestion]) -> BenchmarkResult:
         try:
             resp = httpx.post(
                 f"{API_BASE}/query",
-                json={"question": q.question, "top_k": 5},
+                json={"question": q.question, "top_k": 8},
                 timeout=120,
             )
             resp.raise_for_status()
@@ -439,6 +466,34 @@ def benchmark_queries(questions: list[GoldenQuestion]) -> BenchmarkResult:
         avg_query_latency_ms=round(avg, 2),
         queries_tested=len(latencies),
     )
+
+
+def _warmup_server(max_wait: int = 90) -> None:
+    """Send a dummy query to wake the server before evaluation starts.
+
+    The first real request often times out because the embedding model loads
+    lazily on the first call.  This preflight query absorbs that cold-start
+    cost so that no golden question is lost to a timeout.
+
+    Args:
+        max_wait: Seconds to keep retrying before giving up.
+    """
+    logger.info("Warming up server (max %ds)...", max_wait)
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        try:
+            resp = httpx.post(
+                f"{API_BASE}/query",
+                json={"question": "warmup", "top_k": 1},
+                timeout=min(30.0, deadline - time.time()),
+            )
+            if resp.status_code == 200:
+                logger.info("Server warmup complete")
+                return
+        except Exception:
+            pass
+        time.sleep(3)
+    logger.warning("Server warmup timed out after %ds — proceeding anyway", max_wait)
 
 
 # ── CLI entrypoint ─────────────────────────────────────────────────────────
@@ -459,9 +514,7 @@ def _resolve_azure_data_dir() -> Path:
     from ingestion.pipeline import download_azure_blobs
 
     if not settings.azure_storage_connection_string:
-        logger.error(
-            "AZURE_STORAGE_CONNECTION_STRING must be set for --source azure"
-        )
+        logger.error("AZURE_STORAGE_CONNECTION_STRING must be set for --source azure")
         raise SystemExit(1)
     if not settings.azure_container_name:
         logger.error("AZURE_CONTAINER_NAME must be set for --source azure")
@@ -511,32 +564,47 @@ def main() -> None:
         default="evals/results.json",
         help="Output file path",
     )
+    parser.add_argument(
+        "--use-existing-dataset",
+        action="store_true",
+        help="Skip question generation and use the existing evals/golden_dataset.json as-is",
+    )
     args = parser.parse_args()
 
-    if args.source == "azure":
-        data_dir = _resolve_azure_data_dir()
-    else:
-        data_dir = Path(args.data_dir)
-
-    # Step 1: Generate golden dataset
-    logger.info("Generating golden dataset...")
-    golden = generate_golden_dataset(
-        data_dir,
-        args.sample_size,
-        args.questions,
-    )
-
-    if not golden:
-        logger.error("No golden questions generated. Check data directory.")
-        return
-
-    # Save golden dataset
     golden_path = Path("evals/golden_dataset.json")
-    golden_path.parent.mkdir(parents=True, exist_ok=True)
-    golden_path.write_text(json.dumps([q.model_dump() for q in golden], indent=2))
-    logger.info("Golden dataset saved to %s", golden_path)
+
+    if args.use_existing_dataset:
+        if not golden_path.exists():
+            logger.error("--use-existing-dataset set but %s not found", golden_path)
+            return
+        golden = [GoldenQuestion(**q) for q in json.loads(golden_path.read_text())]
+        logger.info("Loaded %d questions from existing %s", len(golden), golden_path)
+        data_dir = Path(args.data_dir)  # still needed for ingestion benchmark
+    else:
+        if args.source == "azure":
+            data_dir = _resolve_azure_data_dir()
+        else:
+            data_dir = Path(args.data_dir)
+
+        # Step 1: Generate golden dataset
+        logger.info("Generating golden dataset...")
+        golden = generate_golden_dataset(
+            data_dir,
+            args.sample_size,
+            args.questions,
+        )
+
+        if not golden:
+            logger.error("No golden questions generated. Check data directory.")
+            return
+
+        # Save golden dataset
+        golden_path.parent.mkdir(parents=True, exist_ok=True)
+        golden_path.write_text(json.dumps([q.model_dump() for q in golden], indent=2))
+        logger.info("Golden dataset saved to %s", golden_path)
 
     # Step 2: RAGAS evaluation
+    _warmup_server()
     logger.info("Running RAGAS evaluation...")
     eval_results = evaluate_ragas(golden)
 

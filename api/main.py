@@ -369,7 +369,7 @@ def query_documents(request: QueryRequest) -> QueryResponse:
     # ── Query Router: structured (SQL) vs unstructured (RAG) ────────
     answer = ""
     query_type = _classify_query(request.question)
-    logger.info("Router classified %r as %s", request.question[:80], query_type)
+    logger.info("Router classified %r as %s", request.question, query_type)
 
     if query_type == "structured":
         answer, scored_tables, sql_rows = _handle_structured_query(request.question)
@@ -468,7 +468,7 @@ def query_documents_stream(request: QueryRequest) -> StreamingResponse:
 
     # ── Query Router: structured (SQL) vs unstructured (RAG) ────────
     query_type = _classify_query(request.question)
-    logger.info("Router classified %r as %s", request.question[:80], query_type)
+    logger.info("Router classified %r as %s", request.question, query_type)
 
     sql_stream: Iterator[str] | None = None
     if query_type == "structured":
@@ -850,7 +850,10 @@ _SQL_RESULT_SYSTEM_PROMPT = (
     "2. Be concise but complete.\n"
     "3. ALWAYS answer in the SAME LANGUAGE as the question.\n"
     "4. Do NOT show the SQL query.\n"
-    "5. Do NOT add citations or source references."
+    "5. Do NOT add citations or source references.\n"
+    "6. NEVER round, truncate, or approximate numeric values — "
+    "reproduce them exactly as they appear in the query results. "
+    "Never use words like 'approximately', 'about', 'around', or 'roughly'."
 )
 
 
